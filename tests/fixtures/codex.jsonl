@@ -1,0 +1,6 @@
+{"timestamp":"2026-01-01T00:00:00.000Z","type":"session_meta","payload":{"id":"codex-sess-1","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp/work","model_provider":"openai"}}
+{"timestamp":"2026-01-01T00:00:01.000Z","type":"response_item","payload":{"id":"a","type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}
+{"timestamp":"2026-01-01T00:00:02.000Z","type":"response_item","payload":{"id":"b","type":"message","role":"assistant","content":[{"type":"output_text","text":"hi there"}]}}
+{"timestamp":"2026-01-01T00:00:03.000Z","type":"response_item","payload":{"id":"c","type":"function_call","call_id":"call_1","name":"bash","arguments":"{\"cmd\":\"ls\"}"}}
+{"timestamp":"2026-01-01T00:00:04.000Z","type":"response_item","payload":{"id":"d","type":"function_call_output","call_id":"call_1","output":"file1\nfile2\n"}}
+{"timestamp":"2026-01-01T00:00:05.000Z","type":"response_item","payload":{"id":"e","type":"reasoning","summary":[{"type":"summary_text","text":"thinking about it"}]}}

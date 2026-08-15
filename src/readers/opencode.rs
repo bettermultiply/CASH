@@ -1,0 +1,191 @@
+use std::path::Path;
+
+use rusqlite::Connection;
+use serde_json::Value;
+
+use crate::ir::{AgentKind, Event, EventKind, Trace, TraceMeta};
+use crate::util::sha256_hex;
+
+type SessionRow = (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+);
+type ListRow = (String, String, Option<String>, Option<i64>);
+
+/// Parse a session from the OpenCode SQLite store (default ~/.local/share/opencode/opencode.db).
+pub fn read(db_path: &Path, session_id: &str) -> Result<Trace, String> {
+    let conn = Connection::open(db_path).map_err(|e| format!("open {}: {e}", db_path.display()))?;
+
+    let sess: Option<SessionRow> = conn
+        .query_row(
+            "SELECT id, directory, title, model, time_created FROM session WHERE id = ?1",
+            [session_id],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get::<_, Option<i64>>(4)?,
+                ))
+            },
+        )
+        .ok();
+
+    let (sess_id, directory, title, model, started_at) = match sess {
+        Some(s) => s,
+        None => {
+            return Err(format!(
+                "session {session_id} not found in {}",
+                db_path.display()
+            ));
+        }
+    };
+
+    let mut raw = String::new();
+    for row in conn
+        .prepare("SELECT data FROM message WHERE session_id = ?1 ORDER BY time_created, id")
+        .map_err(|e| e.to_string())?
+        .query_map([session_id], |r| r.get::<_, String>(0))
+        .map_err(|e| e.to_string())?
+    {
+        raw.push_str(&row.map_err(|e| e.to_string())?);
+        raw.push('\n');
+    }
+    let file_hash = sha256_hex(&raw);
+
+    let mut events: Vec<Event> = Vec::new();
+
+    for msg in conn
+        .prepare("SELECT id, data, time_created FROM message WHERE session_id = ?1 ORDER BY time_created, id")
+        .map_err(|e| e.to_string())?
+        .query_map([session_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+        })
+        .map_err(|e| e.to_string())?
+    {
+        let (msg_id, msg_data, msg_time) = msg.map_err(|e| e.to_string())?;
+        let mv: Value = serde_json::from_str(&msg_data).map_err(|e| format!("bad message json: {e}"))?;
+        let role = mv.get("role").and_then(Value::as_str).unwrap_or("");
+
+        // Collect this message's parts in order.
+        let parts: Vec<(String, i64)> = conn
+            .prepare("SELECT data, time_created FROM part WHERE message_id = ?1 ORDER BY time_created, id")
+            .map_err(|e| e.to_string())?
+            .query_map([&msg_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<_, _>>()
+            .map_err(|e| e.to_string())?;
+
+        for (part_data, part_time) in parts {
+            let pv: Value = serde_json::from_str(&part_data).map_err(|e| format!("bad part json: {e}"))?;
+            let ptype = pv.get("type").and_then(Value::as_str).unwrap_or("");
+            let time = Some(part_time);
+            match ptype {
+                "text" => {
+                    let text = pv.get("text").and_then(Value::as_str).unwrap_or_default().to_string();
+                    if !text.is_empty() {
+                        let kind = match role {
+                            "user" => EventKind::UserMessage { text },
+                            _ => EventKind::AssistantMessage { text },
+                        };
+                        events.push(Event { time, kind });
+                    }
+                }
+                "reasoning" => {
+                    let text = pv.get("text").and_then(Value::as_str).unwrap_or_default().to_string();
+                    if !text.is_empty() {
+                        events.push(Event {
+                            time,
+                            kind: EventKind::Reasoning { text },
+                        });
+                    }
+                }
+                "tool" => {
+                    let name = pv.get("tool").and_then(Value::as_str).unwrap_or_default().to_string();
+                    let call_id = pv.get("callID").and_then(Value::as_str).unwrap_or_default().to_string();
+                    let state = &pv["state"];
+                    let input = state.get("input").cloned().unwrap_or(Value::Null);
+                    let output = state
+                        .get("output")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let exit = state
+                        .get("metadata")
+                        .and_then(|m| m.get("exit"))
+                        .and_then(Value::as_i64)
+                        .map(|x| x as i32);
+                    let status = state.get("status").and_then(Value::as_str).unwrap_or("");
+                    let arguments = serde_json::to_string(&input).unwrap_or_default();
+                    let is_error = status == "error" && output.is_empty();
+
+                    events.push(Event {
+                        time,
+                        kind: EventKind::ToolCall {
+                            id: call_id.clone(),
+                            name,
+                            arguments,
+                        },
+                    });
+                    events.push(Event {
+                        time,
+                        kind: EventKind::ToolResult {
+                            call_id,
+                            output,
+                            exit_code: exit,
+                            error: is_error.then(|| "tool reported error".to_string()),
+                        },
+                    });
+                }
+                _ => {}
+            }
+        }
+        let _ = msg_time;
+    }
+
+    let meta = TraceMeta {
+        source: AgentKind::OpenCode,
+        session_id: sess_id,
+        file: format!("{}({session_id})", db_path.display()),
+        cwd: directory,
+        title,
+        model,
+        started_at,
+        ended_at: None,
+        source_file_sha256: file_hash,
+        events_sha256: String::new(),
+        event_count: 0,
+    };
+    let mut meta = meta;
+    crate::util::finish_meta(&mut meta, &events);
+    Ok(Trace { meta, events })
+}
+
+/// List available sessions from the OpenCode SQLite store.
+pub fn list_sessions(db_path: &Path) -> Result<Vec<ListRow>, String> {
+    let conn = Connection::open(db_path).map_err(|e| format!("open {}: {e}", db_path.display()))?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, directory, title, time_updated FROM session ORDER BY time_updated DESC",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r.map_err(|e| e.to_string())?);
+    }
+    Ok(out)
+}

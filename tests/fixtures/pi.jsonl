@@ -1,0 +1,5 @@
+{"type":"session","version":3,"id":"pi-sess-1","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp/work"}
+{"type":"model_change","id":"m1","parentId":null,"timestamp":"2026-01-01T00:00:00.100Z","provider":"deepseek","modelId":"deepseek-v4-flash"}
+{"type":"message","id":"msg1","parentId":"m1","timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"what time"}]}}
+{"type":"message","id":"msg2","parentId":"msg1","timestamp":"2026-01-01T00:00:02.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"need current time"},{"type":"text","text":"let me check"},{"type":"toolCall","id":"call_a","name":"bash","arguments":{"command":"date"}}]}}
+{"type":"message","id":"msg3","parentId":"msg2","timestamp":"2026-01-01T00:00:03.000Z","message":{"role":"toolResult","toolCallId":"call_a","toolName":"bash","content":[{"type":"text","text":"2026-01-01"}]}}

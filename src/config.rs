@@ -1,0 +1,67 @@
+use std::path::PathBuf;
+
+use serde::Deserialize;
+
+#[derive(Debug, Default, Deserialize)]
+struct ConfigFile {
+    seed_dir: Option<PathBuf>,
+}
+
+pub fn default_seed_dir() -> PathBuf {
+    if let Ok(v) = std::env::var("MIGRATE_SEED_DIR")
+        && !v.trim().is_empty()
+    {
+        return expand_home(PathBuf::from(v));
+    }
+
+    if let Some(cfg) = read_config()
+        && let Some(seed_dir) = cfg.seed_dir
+    {
+        return expand_home(seed_dir);
+    }
+
+    home_dir().join(".local/share/migrate/seeds")
+}
+
+pub fn default_seed_output(agent: &str, session_id: &str) -> PathBuf {
+    default_seed_dir()
+        .join(agent)
+        .join(sanitize_path_segment(session_id))
+}
+
+pub fn home_dir() -> PathBuf {
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."))
+}
+
+fn read_config() -> Option<ConfigFile> {
+    let path = std::env::var("MIGRATE_CONFIG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| home_dir().join(".config/migrate/config.json"));
+    let raw = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn expand_home(path: PathBuf) -> PathBuf {
+    let s = path.to_string_lossy();
+    if s == "~" {
+        home_dir()
+    } else if let Some(rest) = s.strip_prefix("~/") {
+        home_dir().join(rest)
+    } else {
+        path
+    }
+}
+
+fn sanitize_path_segment(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
