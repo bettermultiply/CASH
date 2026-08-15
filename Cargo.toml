@@ -1,8 +1,10 @@
 [package]
-name = "migrate"
+name = "cash"
 version = "0.1.0"
 edition = "2024"
-default-run = "migrate"
+default-run = "cash"
+description = "CASH: Cross-Agent Session History for coding agents"
+readme = "README.md"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

@@ -101,6 +101,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
+name = "cash"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "getrandom 0.2.17",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "uuid",
+]
+
+[[package]]
 name = "cc"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -383,20 +397,6 @@ name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
-
-[[package]]
-name = "migrate"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "clap",
- "getrandom 0.2.17",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2",
- "uuid",
-]
 
 [[package]]
 name = "num-traits"

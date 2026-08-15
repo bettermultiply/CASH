@@ -70,8 +70,8 @@ pub fn import_existing(
     let mut message_count = 0usize;
     let mut used_ids = HashSet::new();
     let mut tool_names: HashMap<String, String> = HashMap::new();
-    let mut current_provider = "migrate".to_string();
-    let mut current_model = trace.meta.model.clone().unwrap_or_else(|| "migrate".into());
+    let mut current_provider = "cash".to_string();
+    let mut current_model = trace.meta.model.clone().unwrap_or_else(|| "cash".into());
 
     for ev in &trace.events {
         let id = short_id(&mut used_ids);
@@ -116,7 +116,7 @@ pub fn import_existing(
                     &current_model,
                     "stop",
                     ts,
-                    json!([{"type": "thinking", "thinking": text, "thinkingSignature": "migrate"}]),
+                    json!([{"type": "thinking", "thinking": text, "thinkingSignature": "cash"}]),
                 ),
             ),
             EventKind::ToolCall {
@@ -226,7 +226,7 @@ fn assistant_message(
     json!({
         "role": "assistant",
         "content": content,
-        "api": "migrate",
+        "api": "cash",
         "provider": provider,
         "model": model,
         "usage": {

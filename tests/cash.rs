@@ -1,10 +1,10 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use migrate::export;
-use migrate::import;
-use migrate::ir::EventKind;
-use migrate::readers;
+use cash::export;
+use cash::import;
+use cash::ir::EventKind;
+use cash::readers;
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -113,7 +113,7 @@ fn pi_reader_extracts_events() {
 #[test]
 fn export_writes_seed_files_and_manifest() {
     let trace = readers::pi::read(&fixture("pi.jsonl")).unwrap();
-    let dir = std::env::temp_dir().join(format!("migrate-test-{}", uuid::Uuid::new_v4().simple()));
+    let dir = std::env::temp_dir().join(format!("cash-test-{}", uuid::Uuid::new_v4().simple()));
     let manifest = export::write_seed(&trace, &dir).expect("write seed");
 
     assert!(dir.join("seed.json").exists());
@@ -124,7 +124,7 @@ fn export_writes_seed_files_and_manifest() {
 
     // seed.json round-trips back to an equivalent trace
     let raw = std::fs::read_to_string(dir.join("seed.json")).unwrap();
-    let re: migrate::ir::Trace = serde_json::from_str(&raw).unwrap();
+    let re: cash::ir::Trace = serde_json::from_str(&raw).unwrap();
     assert_eq!(re.events.len(), trace.events.len());
     assert_eq!(re.meta.events_sha256, trace.meta.events_sha256);
 
@@ -134,7 +134,7 @@ fn export_writes_seed_files_and_manifest() {
 #[test]
 fn import_into_opencode_round_trips() {
     let trace = readers::pi::read(&fixture("pi.jsonl")).unwrap();
-    let dir = std::env::temp_dir().join(format!("migrate-db-{}", uuid::Uuid::new_v4().simple()));
+    let dir = std::env::temp_dir().join(format!("cash-db-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&dir).unwrap();
     let db = dir.join("opencode.db");
     create_schema(&db);
@@ -158,7 +158,7 @@ fn import_into_opencode_round_trips() {
 #[test]
 fn import_into_pi_round_trips_all_events() {
     let trace = readers::pi::read(&fixture("pi.jsonl")).unwrap();
-    let dir = std::env::temp_dir().join(format!("migrate-pi-{}", uuid::Uuid::new_v4().simple()));
+    let dir = std::env::temp_dir().join(format!("cash-pi-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&dir).unwrap();
 
     let result = import::pi::import(&trace, &dir).expect("import pi");
@@ -269,7 +269,7 @@ fn sanitized_real_codex_fixture_covers_modern_tool_shapes() {
 #[test]
 fn sanitized_real_opencode_fixture_parses_sql_session() {
     let dir = std::env::temp_dir().join(format!(
-        "migrate-real-sql-{}",
+        "cash-real-sql-{}",
         uuid::Uuid::new_v4().simple()
     ));
     std::fs::create_dir_all(&dir).unwrap();
@@ -382,7 +382,7 @@ fn convert_refuses_continued_pi_target_unless_forced() {
 fn opencode_import_updates_same_session_and_protects_continuation() {
     let trace = readers::pi::read(&fixture("pi.jsonl")).unwrap();
     let root = std::env::temp_dir().join(format!(
-        "migrate-open-update-{}",
+        "cash-open-update-{}",
         uuid::Uuid::new_v4().simple()
     ));
     std::fs::create_dir_all(&root).unwrap();
@@ -459,7 +459,7 @@ struct CliTestEnv {
 
 fn cli_test_env(label: &str) -> CliTestEnv {
     let root = std::env::temp_dir().join(format!(
-        "migrate-cli-{label}-{}",
+        "cash-cli-{label}-{}",
         uuid::Uuid::new_v4().simple()
     ));
     std::fs::create_dir_all(&root).unwrap();
@@ -479,7 +479,7 @@ fn cli_test_env(label: &str) -> CliTestEnv {
 }
 
 fn run_convert(env: &CliTestEnv, force: bool) -> std::process::Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_migrate"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cash"));
     command.args([
         "convert",
         "opencode",

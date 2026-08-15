@@ -2,19 +2,19 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
-use migrate::config;
-use migrate::export;
-use migrate::import;
-use migrate::ir;
-use migrate::ir::AgentKind;
-use migrate::readers;
-use migrate::sync;
-use migrate::util;
+use cash::config;
+use cash::export;
+use cash::import;
+use cash::ir;
+use cash::ir::AgentKind;
+use cash::readers;
+use cash::sync;
+use cash::util;
 
 #[derive(Parser)]
 #[command(
-    name = "migrate",
-    about = "Cross coding-agent execution history migration tool",
+    name = "cash",
+    about = "CASH — Cross-Agent Session History",
     version
 )]
 struct Cli {
@@ -34,7 +34,7 @@ enum Command {
         #[arg(long)]
         opencode_db: Option<PathBuf>,
     },
-    /// Read an agent session and export a portable seed (seed.json + seed.md + manifest.json)
+    /// Export an agent session as a portable CASH seed
     Export {
         agent: String,
         session: String,
@@ -47,7 +47,7 @@ enum Command {
         #[arg(long)]
         opencode_db: Option<PathBuf>,
     },
-    /// Convert one agent session directly into another agent's native storage
+    /// Materialize one agent session into another agent's native history
     Convert {
         source_agent: String,
         session: String,
@@ -63,7 +63,7 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Import a seed into a target agent's native storage
+    /// Materialize a CASH seed into native agent storage
     Import {
         agent: String,
         #[arg(short, long)]
@@ -75,7 +75,7 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Diff the seed's source and target sessions against the manifest
+    /// Inspect source and target state recorded by a CASH seed
     Status {
         seed: Option<PathBuf>,
         #[arg(long)]
@@ -368,7 +368,7 @@ fn resolve_seed_dir(seed: Option<PathBuf>) -> Result<PathBuf, String> {
 
     latest_seed_dir(&base).ok_or_else(|| {
         format!(
-            "no seed specified and no seed found under {} (set MIGRATE_SEED_DIR, ~/.config/migrate/config.json, or pass --seed)",
+            "no seed specified and no seed found under {} (set CASH_SEED_DIR, ~/.config/cash/config.json, or pass --seed)",
             base.display()
         )
     })

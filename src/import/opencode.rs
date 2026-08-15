@@ -95,10 +95,10 @@ pub fn import_existing(
             &version,
             now,
             now,
-            "migrate",
+            "cash",
             serde_json::to_string(&json!({
-                "id": trace.meta.model.clone().unwrap_or_else(|| "migrate".into()),
-                "providerID": "migrate",
+                "id": trace.meta.model.clone().unwrap_or_else(|| "cash".into()),
+                "providerID": "cash",
                 "variant": "default"
             })).unwrap_or_default(),
         ],

@@ -8,19 +8,33 @@ struct ConfigFile {
 }
 
 pub fn default_seed_dir() -> PathBuf {
-    if let Ok(v) = std::env::var("MIGRATE_SEED_DIR")
-        && !v.trim().is_empty()
-    {
-        return expand_home(PathBuf::from(v));
+    if let Some(path) = env_path("CASH_SEED_DIR") {
+        return path;
     }
 
-    if let Some(cfg) = read_config()
+    if let Some(cfg) = read_config("CASH_CONFIG", ".config/cash/config.json")
         && let Some(seed_dir) = cfg.seed_dir
     {
         return expand_home(seed_dir);
     }
 
-    home_dir().join(".local/share/migrate/seeds")
+    // Read-only compatibility for mappings created before the CASH rename.
+    if let Some(path) = env_path("MIGRATE_SEED_DIR") {
+        return path;
+    }
+    if let Some(cfg) = read_config("MIGRATE_CONFIG", ".config/migrate/config.json")
+        && let Some(seed_dir) = cfg.seed_dir
+    {
+        return expand_home(seed_dir);
+    }
+
+    let cash = home_dir().join(".local/share/cash/seeds");
+    let legacy = home_dir().join(".local/share/migrate/seeds");
+    if !cash.exists() && legacy.exists() {
+        legacy
+    } else {
+        cash
+    }
 }
 
 pub fn default_seed_output(agent: &str, session_id: &str) -> PathBuf {
@@ -35,12 +49,20 @@ pub fn home_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("."))
 }
 
-fn read_config() -> Option<ConfigFile> {
-    let path = std::env::var("MIGRATE_CONFIG")
+fn read_config(env_name: &str, default: &str) -> Option<ConfigFile> {
+    let path = std::env::var(env_name)
         .map(PathBuf::from)
-        .unwrap_or_else(|_| home_dir().join(".config/migrate/config.json"));
+        .unwrap_or_else(|_| home_dir().join(default));
     let raw = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&raw).ok()
+}
+
+fn env_path(name: &str) -> Option<PathBuf> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .map(expand_home)
 }
 
 fn expand_home(path: PathBuf) -> PathBuf {

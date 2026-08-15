@@ -1,18 +1,19 @@
 use std::path::{Path, PathBuf};
 
-use migrate::{config, import, readers};
+use cash::{config, import, readers};
 
 #[test]
 #[ignore = "reads local agent histories; writes only temp copies / temp roots"]
 fn real_pi_and_opencode_sessions_smoke() {
     let home = config::home_dir();
     let pi_root = home.join(".pi/agent/sessions");
-    let opencode_db = std::env::var("MIGRATE_REAL_OPENCODE_DB")
+    let opencode_db = std::env::var("CASH_REAL_OPENCODE_DB")
+        .or_else(|_| std::env::var("MIGRATE_REAL_OPENCODE_DB"))
         .map(PathBuf::from)
         .unwrap_or_else(|_| home.join(".local/share/opencode/opencode.db"));
 
     let pi_path = pick_pi_session(&pi_root);
-    let tmp = std::env::temp_dir().join(format!("migrate-real-{}", uuid::Uuid::new_v4().simple()));
+    let tmp = std::env::temp_dir().join(format!("cash-real-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&tmp).unwrap();
 
     let pi_trace = readers::pi::read(&pi_path).expect("read real pi session");
@@ -45,7 +46,9 @@ fn real_pi_and_opencode_sessions_smoke() {
 }
 
 fn pick_pi_session(root: &Path) -> PathBuf {
-    if let Ok(v) = std::env::var("MIGRATE_REAL_PI_SESSION") {
+    if let Ok(v) = std::env::var("CASH_REAL_PI_SESSION")
+        .or_else(|_| std::env::var("MIGRATE_REAL_PI_SESSION"))
+    {
         let direct = PathBuf::from(&v);
         if direct.exists() {
             return direct;
@@ -55,7 +58,7 @@ fn pick_pi_session(root: &Path) -> PathBuf {
             .into_iter()
             .find(|(id, _)| id == &v)
             .map(|(_, path)| path)
-            .expect("MIGRATE_REAL_PI_SESSION not found");
+            .expect("CASH_REAL_PI_SESSION not found");
     }
     readers::pi::list_sessions(root)
         .unwrap()
@@ -70,7 +73,9 @@ fn pick_pi_session(root: &Path) -> PathBuf {
 }
 
 fn pick_opencode_session(db: &Path) -> String {
-    if let Ok(v) = std::env::var("MIGRATE_REAL_OPENCODE_SESSION") {
+    if let Ok(v) = std::env::var("CASH_REAL_OPENCODE_SESSION")
+        .or_else(|_| std::env::var("MIGRATE_REAL_OPENCODE_SESSION"))
+    {
         return v;
     }
     readers::opencode::list_sessions(db)
