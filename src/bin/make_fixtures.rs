@@ -19,12 +19,17 @@ fn main() -> Result<(), String> {
     let codex_root = home.join(".codex/sessions");
     let opencode_db = home.join(".local/share/opencode/opencode.db");
 
-    let pi_path = env_path("CASH_FIXTURE_PI_SESSION", "MIGRATE_FIXTURE_PI_SESSION").unwrap_or_else(|| {
-        pick_jsonl(&pi_root, &["toolCall", "toolResult", "thinking"]).expect("pick pi session")
-    });
+    let pi_path =
+        env_path("CASH_FIXTURE_PI_SESSION", "MIGRATE_FIXTURE_PI_SESSION").unwrap_or_else(|| {
+            pick_jsonl(&pi_root, &["toolCall", "toolResult", "thinking"]).expect("pick pi session")
+        });
     sanitize_jsonl(&pi_path, &out.join("pi_real_sanitized.jsonl"))?;
 
-    let codex_path = env_path("CASH_FIXTURE_CODEX_SESSION", "MIGRATE_FIXTURE_CODEX_SESSION").unwrap_or_else(|| {
+    let codex_path = env_path(
+        "CASH_FIXTURE_CODEX_SESSION",
+        "MIGRATE_FIXTURE_CODEX_SESSION",
+    )
+    .unwrap_or_else(|| {
         pick_jsonl(&codex_root, &["function_call", "function_call_output"])
             .expect("pick codex session")
     });
@@ -34,7 +39,7 @@ fn main() -> Result<(), String> {
         "CASH_FIXTURE_OPENCODE_SESSION",
         "MIGRATE_FIXTURE_OPENCODE_SESSION",
     )
-        .unwrap_or_else(|| pick_opencode_session(&opencode_db).expect("pick opencode session"));
+    .unwrap_or_else(|| pick_opencode_session(&opencode_db).expect("pick opencode session"));
     sanitize_opencode_sql(
         &opencode_db,
         &opencode_session,

@@ -35,6 +35,7 @@ fn codex_reader_extracts_events() {
             EventKind::ToolCall { .. } => "tool_call",
             EventKind::ToolResult { .. } => "tool_result",
             EventKind::ModelChange { .. } => "model_change",
+            EventKind::NativeRecord { .. } => "native_record",
         })
         .collect();
     assert_eq!(
@@ -79,6 +80,7 @@ fn pi_reader_extracts_events() {
             EventKind::ToolCall { .. } => "tool_call",
             EventKind::ToolResult { .. } => "tool_result",
             EventKind::ModelChange { .. } => "model_change",
+            EventKind::NativeRecord { .. } => "native_record",
         })
         .collect();
     assert_eq!(
@@ -146,7 +148,9 @@ fn import_into_opencode_round_trips() {
     assert!(!result.anchor_message_id.is_empty());
     assert!(result.anchor_message_id.starts_with("msg_"));
     assert_eq!(result.anchor_message_id.len(), 30);
-    assert_eq!(result.message_count, 4);
+    // 4 native records -> 4 groups; the model_change group is dropped by the
+    // OpenCode target, leaving user + assistant + toolResult = 3 messages.
+    assert_eq!(result.message_count, 3);
 
     // re-read the imported session: model_change is the only dropped event
     let back = readers::opencode::read(&db, &result.session_id).expect("re-read");
@@ -163,7 +167,9 @@ fn import_into_pi_round_trips_all_events() {
 
     let result = import::pi::import(&trace, &dir).expect("import pi");
     assert!(std::path::Path::new(&result.file).exists());
-    assert_eq!(result.message_count, trace.events.len());
+    let native_entries: std::collections::HashSet<_> =
+        trace.events.iter().map(|e| &e.original_id).collect();
+    assert_eq!(result.message_count, native_entries.len());
     assert!(!result.anchor_message_id.is_empty());
 
     let mut assistant_count = 0;
@@ -219,9 +225,130 @@ fn import_into_pi_round_trips_all_events() {
 
     let back = readers::pi::read(std::path::Path::new(&result.file)).expect("re-read pi");
     assert_eq!(back.events.len(), trace.events.len());
-    assert_eq!(back.meta.events_sha256, trace.meta.events_sha256);
+    let kinds: Vec<&str> = back
+        .events
+        .iter()
+        .map(|e| match &e.kind {
+            EventKind::UserMessage { .. } => "user",
+            EventKind::AssistantMessage { .. } => "assistant",
+            EventKind::Reasoning { .. } => "reasoning",
+            EventKind::ToolCall { .. } => "tool_call",
+            EventKind::ToolResult { .. } => "tool_result",
+            EventKind::ModelChange { .. } => "model_change",
+            EventKind::NativeRecord { .. } => "native_record",
+        })
+        .collect();
+    let expected: Vec<&str> = trace
+        .events
+        .iter()
+        .map(|e| match &e.kind {
+            EventKind::UserMessage { .. } => "user",
+            EventKind::AssistantMessage { .. } => "assistant",
+            EventKind::Reasoning { .. } => "reasoning",
+            EventKind::ToolCall { .. } => "tool_call",
+            EventKind::ToolResult { .. } => "tool_result",
+            EventKind::ModelChange { .. } => "model_change",
+            EventKind::NativeRecord { .. } => "native_record",
+        })
+        .collect();
+    assert_eq!(kinds, expected);
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn codex_import_produces_resumable_rollout() {
+    let trace = readers::pi::read(&fixture("pi.jsonl")).unwrap();
+    let dir = std::env::temp_dir().join(format!("cash-codex-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let result = import::codex::import(&trace, &dir).expect("import codex");
+    let lines = load_jsonl(std::path::Path::new(&result.file));
+    assert_eq!(lines[0]["type"], "session_meta");
+    assert!(lines[0]["payload"]["id"].as_str().is_some());
+
+    let mut counts = std::collections::HashMap::new();
+    for line in &lines[1..] {
+        assert_eq!(line["type"], "response_item");
+        let ptype = line["payload"]["type"].as_str().unwrap();
+        *counts.entry(ptype.to_string()).or_insert(0usize) += 1;
+    }
+    assert!(counts.contains_key("message"));
+    assert!(counts.contains_key("function_call"));
+    assert!(counts.contains_key("function_call_output"));
+    // Codex has no model-change event; default-model policy drops it.
+    assert!(!counts.contains_key("model_change"));
+
+    // every function call links to an output via call_id
+    let calls: Vec<_> = lines[1..]
+        .iter()
+        .filter(|l| l["payload"]["type"] == "function_call")
+        .collect();
+    assert!(!calls.is_empty());
+    for call in &calls {
+        assert!(
+            call["payload"]["call_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("call_")
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn codex_to_codex_round_trip_preserves_events() {
+    let src = real_fixture("codex_real_sanitized.jsonl");
+    let trace = readers::codex::read(&src).unwrap();
+    assert!(trace.events.len() > 100);
+
+    let dir = std::env::temp_dir().join(format!(
+        "cash-codex-lossless-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let result = import::codex::import(&trace, &dir).expect("import codex");
+
+    // session -> events is lossless: re-reading the materialized session yields
+    // the same events (same original ids, content, turn linkage).
+    let back = readers::codex::read(std::path::Path::new(&result.file)).unwrap();
+    let a = serde_json::to_string(&trace.events).unwrap();
+    let b = serde_json::to_string(&back.events).unwrap();
+    assert_eq!(a, b, "codex -> codex round trip changed the event trace");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pi_to_pi_round_trip_preserves_events() {
+    let src = real_fixture("pi_real_sanitized.jsonl");
+    let trace = readers::pi::read(&src).unwrap();
+    assert!(trace.events.len() > 100);
+
+    let dir = std::env::temp_dir().join(format!(
+        "cash-pi-lossless-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let result = import::pi::import(&trace, &dir).expect("import pi");
+
+    // session -> events is lossless: re-reading the materialized session yields
+    // the same events (same original ids, parent chain, content, native metadata).
+    let back = readers::pi::read(std::path::Path::new(&result.file)).unwrap();
+    let a = serde_json::to_string(&trace.events).unwrap();
+    let b = serde_json::to_string(&back.events).unwrap();
+    assert_eq!(a, b, "pi -> pi round trip changed the event trace");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn load_jsonl(path: &std::path::Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
 }
 
 #[test]
@@ -268,10 +395,7 @@ fn sanitized_real_codex_fixture_covers_modern_tool_shapes() {
 
 #[test]
 fn sanitized_real_opencode_fixture_parses_sql_session() {
-    let dir = std::env::temp_dir().join(format!(
-        "cash-real-sql-{}",
-        uuid::Uuid::new_v4().simple()
-    ));
+    let dir = std::env::temp_dir().join(format!("cash-real-sql-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&dir).unwrap();
     let db = dir.join("opencode.db");
     create_schema(&db);
@@ -389,13 +513,14 @@ fn opencode_import_updates_same_session_and_protects_continuation() {
     let db = root.join("opencode.db");
     create_schema(&db);
 
-    let first = import::opencode::import_existing(&trace, &db, None, None, false).unwrap();
+    let first = import::opencode::import_existing(&trace, &db, None, None, false, None).unwrap();
     let second = import::opencode::import_existing(
         &trace,
         &db,
         Some(&first.session_id),
         Some(&first.anchor_message_id),
         false,
+        None,
     )
     .unwrap();
     assert_eq!(second.session_id, first.session_id);
@@ -425,6 +550,7 @@ fn opencode_import_updates_same_session_and_protects_continuation() {
         Some(&first.session_id),
         Some(&second.anchor_message_id),
         false,
+        None,
     );
     assert!(conflict.unwrap_err().contains("--force"));
 
@@ -434,6 +560,7 @@ fn opencode_import_updates_same_session_and_protects_continuation() {
         Some(&first.session_id),
         Some(&second.anchor_message_id),
         true,
+        None,
     )
     .unwrap();
     assert_eq!(forced.session_id, first.session_id);

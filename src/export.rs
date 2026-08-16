@@ -189,6 +189,9 @@ pub fn to_markdown(trace: &Trace) -> String {
                         .unwrap_or_default()
                 ));
             }
+            EventKind::NativeRecord { record_type } => {
+                s.push_str(&format!("> 原生记录 `{record_type}`（保留原文）\n\n"));
+            }
         }
     }
     s

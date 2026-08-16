@@ -11,7 +11,7 @@ use crate::ir::{EventKind, Trace};
 /// Inject `trace` into an OpenCode SQLite store as a fresh synthetic session.
 /// Returns the created session id and the anchor (last injected message id).
 pub fn import(trace: &Trace, db_path: &Path) -> Result<ImportResult, String> {
-    import_existing(trace, db_path, None, None, false)
+    import_existing(trace, db_path, None, None, false, None)
 }
 
 pub fn import_existing(
@@ -20,6 +20,7 @@ pub fn import_existing(
     existing_session_id: Option<&str>,
     existing_anchor: Option<&str>,
     force: bool,
+    model_override: Option<&str>,
 ) -> Result<ImportResult, String> {
     let mut conn =
         Connection::open(db_path).map_err(|e| format!("open {}: {e}", db_path.display()))?;
@@ -39,11 +40,13 @@ pub fn import_existing(
             }
             if exists {
                 if let Some(anchor) = existing_anchor
-                    && !force && opencode_has_messages_after_anchor(&tx, id, anchor)? {
-                        return Err(format!(
-                            "target OpenCode session continued after anchor; refusing to overwrite {id} (use --force to replace it)"
-                        ));
-                    }
+                    && !force
+                    && opencode_has_messages_after_anchor(&tx, id, anchor)?
+                {
+                    return Err(format!(
+                        "target OpenCode session continued after anchor; refusing to overwrite {id} (use --force to replace it)"
+                    ));
+                }
                 tx.execute("DELETE FROM part WHERE session_id = ?1", [id])
                     .map_err(|e| format!("delete old parts: {e}"))?;
                 tx.execute("DELETE FROM message WHERE session_id = ?1", [id])
@@ -97,7 +100,10 @@ pub fn import_existing(
             now,
             "cash",
             serde_json::to_string(&json!({
-                "id": trace.meta.model.clone().unwrap_or_else(|| "cash".into()),
+                "id": model_override
+                    .map(str::to_owned)
+                    .or_else(|| trace.meta.model.clone())
+                    .unwrap_or_else(|| "cash".into()),
                 "providerID": "cash",
                 "variant": "default"
             })).unwrap_or_default(),
@@ -109,127 +115,140 @@ pub fn import_existing(
     let mut message_count = 0usize;
     let mut dropped_event_count = 0usize;
 
-    let (mut pending_msg, mut pending_role): (Option<String>, Option<String>) = (None, None);
-    let mut tool_ctx: Option<(String, EventKind)> = None;
+    // Events are the single representation. Consecutive events sharing an
+    // original_id (a message) are grouped into one message row with its parts.
+    let mut i = 0usize;
+    let mut pending_tool: Option<(String, String, String)> = None;
+    while i < trace.events.len() {
+        let oid = trace.events[i].original_id.clone();
+        let mut j = i;
+        while j < trace.events.len() && trace.events[j].original_id == oid {
+            j += 1;
+        }
+        let group = &trace.events[i..j];
 
-    for ev in &trace.events {
-        match &ev.kind {
-            EventKind::UserMessage { text } | EventKind::AssistantMessage { text } => {
-                let role = if matches!(ev.kind, EventKind::UserMessage { .. }) {
-                    "user"
-                } else {
-                    "assistant"
-                };
-                close_message(&tx, &mut pending_msg, &mut pending_role, &session_id, now)?;
-                let event_time = now + message_count as i64;
-                let mid = insert_message(&tx, &session_id, role, event_time)?;
-                message_count += 1;
-                insert_part(
-                    &tx,
-                    &session_id,
-                    &mid,
-                    json!({"type": "text", "text": text}),
-                    event_time,
-                )?;
-                pending_msg = Some(mid);
-                pending_role = Some(role.to_string());
-                anchor = pending_msg.clone();
-            }
-            EventKind::Reasoning { text } => {
-                if pending_role.as_deref() == Some("assistant") {
-                    if let Some(mid) = &pending_msg {
-                        insert_part(
-                            &tx,
-                            &session_id,
-                            mid,
-                            json!({"type": "reasoning", "text": text}),
-                            now,
-                        )?;
-                    }
-                } else {
-                    close_message(&tx, &mut pending_msg, &mut pending_role, &session_id, now)?;
-                    let event_time = now + message_count as i64;
-                    let mid = insert_message(&tx, &session_id, "assistant", event_time)?;
-                    message_count += 1;
+        // A group consisting only of model_change (no OpenCode representation)
+        // or native passthrough records is skipped entirely.
+        let materializable = group.iter().any(|e| {
+            !matches!(
+                e.kind,
+                EventKind::ModelChange { .. } | EventKind::NativeRecord { .. }
+            )
+        });
+        if !materializable {
+            dropped_event_count += group.len();
+            i = j;
+            continue;
+        }
+
+        let role = if group
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::UserMessage { .. }))
+        {
+            "user"
+        } else {
+            "assistant"
+        };
+        let data = group
+            .iter()
+            .find_map(|e| e.native.clone())
+            .filter(|n| n.get("role").is_some())
+            .unwrap_or_else(|| json!({ "role": role }));
+        let msg_id = opencode_unique_id(&tx, "message", "msg", IDDirection::Ascending)?;
+        let event_time = now + message_count as i64;
+        tx.execute(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?1, ?2, ?3, ?3, ?4)",
+            params![
+                &msg_id,
+                &session_id,
+                event_time,
+                serde_json::to_string(&data).unwrap_or_default(),
+            ],
+        )
+        .map_err(|e| format!("insert message: {e}"))?;
+
+        let mut tool_call: Option<(String, String, String)> = None;
+        let mut tool_result: Option<(String, String, Option<i32>, Option<String>)> = None;
+        for ev in group {
+            match &ev.kind {
+                EventKind::UserMessage { text } | EventKind::AssistantMessage { text } => {
                     insert_part(
                         &tx,
                         &session_id,
-                        &mid,
+                        &msg_id,
+                        json!({"type": "text", "text": text}),
+                        event_time,
+                    )?;
+                }
+                EventKind::Reasoning { text } => {
+                    insert_part(
+                        &tx,
+                        &session_id,
+                        &msg_id,
                         json!({"type": "reasoning", "text": text}),
                         event_time,
                     )?;
-                    pending_msg = Some(mid);
-                    pending_role = Some("assistant".into());
                 }
-            }
-            EventKind::ToolCall {
-                id,
-                name,
-                arguments,
-                ..
-            } => {
-                // OpenCode stores call+result in one tool part; buffer the call
-                // and flush it together with the following result.
-                tool_ctx = Some((
-                    id.clone(),
-                    EventKind::ToolCall {
-                        id: id.clone(),
-                        name: name.clone(),
-                        arguments: arguments.clone(),
-                    },
-                ));
-            }
-            EventKind::ToolResult {
-                call_id,
-                output,
-                exit_code,
-                error,
-            } => {
-                let (name, args) = match &tool_ctx {
-                    Some((
-                        cid,
-                        EventKind::ToolCall {
-                            name, arguments, ..
-                        },
-                    )) if cid == call_id => (name.clone(), arguments.clone()),
-                    _ => ("tool".to_string(), "{}".to_string()),
-                };
-                let args_val: Value =
-                    serde_json::from_str(&args).unwrap_or(Value::String(args.clone()));
-                close_message(&tx, &mut pending_msg, &mut pending_role, &session_id, now)?;
-                let event_time = now + message_count as i64;
-                let mid = insert_message(&tx, &session_id, "assistant", event_time)?;
-                message_count += 1;
-                let part = json!({
-                    "type": "tool",
-                    "tool": name,
-                    "callID": call_id,
-                    "state": {
-                        "status": if error.is_some() { "error" } else { "completed" },
-                        "input": args_val,
-                        "output": output,
-                        "metadata": {
-                            "exit": exit_code,
-                            "truncated": false
-                        },
-                        "time": { "start": event_time, "end": event_time }
-                    }
-                });
-                insert_part(&tx, &session_id, &mid, part, event_time)?;
-                pending_msg = Some(mid);
-                pending_role = Some("assistant".into());
-                anchor = pending_msg.clone();
-                tool_ctx = None;
-            }
-            EventKind::ModelChange { .. } => {
-                dropped_event_count += 1;
+                EventKind::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                    ..
+                } => {
+                    tool_call = Some((id.clone(), name.clone(), arguments.clone()));
+                }
+                EventKind::ToolResult {
+                    call_id,
+                    output,
+                    exit_code,
+                    error,
+                } => {
+                    tool_result =
+                        Some((call_id.clone(), output.clone(), *exit_code, error.clone()));
+                }
+                EventKind::ModelChange { .. } => {
+                    dropped_event_count += 1;
+                }
+                EventKind::NativeRecord { .. } => {}
             }
         }
+        // OpenCode stores call+result in a single tool part. A call and its
+        // result may come from different native records (e.g. Pi), so buffer
+        // the call across groups.
+        if tool_call.is_some() {
+            pending_tool = tool_call.clone();
+        }
+        if let Some((call_id, output, exit, error)) = tool_result {
+            let (name, args) = match (tool_call, &pending_tool) {
+                (Some((_, name, args)), _) => (name, args.clone()),
+                (None, Some((_, name, args))) => (name.clone(), args.clone()),
+                _ => ("tool".to_string(), "{}".to_string()),
+            };
+            let args_val: Value = serde_json::from_str(&args).unwrap_or(Value::String(args));
+            let part = json!({
+                "type": "tool",
+                "tool": name,
+                "callID": call_id,
+                "state": {
+                    "status": if error.is_some() { "error" } else { "completed" },
+                    "input": args_val,
+                    "output": output,
+                    "metadata": {
+                        "exit": exit,
+                        "truncated": false
+                    },
+                    "time": { "start": event_time, "end": event_time }
+                }
+            });
+            insert_part(&tx, &session_id, &msg_id, part, event_time)?;
+            pending_tool = None;
+        }
+
+        anchor = Some(msg_id);
+        message_count += 1;
+        i = j;
     }
-    if tool_ctx.is_some() {
-        dropped_event_count += 1;
-    }
-    close_message(&tx, &mut pending_msg, &mut pending_role, &session_id, now)?;
+    let _ = dropped_event_count;
 
     tx.commit().map_err(|e| format!("commit: {e}"))?;
 
@@ -306,22 +325,6 @@ fn resolve_project(tx: &Connection, cwd: &str, now: i64) -> Result<String, Strin
     Ok(id)
 }
 
-fn insert_message(
-    tx: &Connection,
-    session_id: &str,
-    role: &str,
-    now: i64,
-) -> Result<String, String> {
-    let mid = opencode_unique_id(tx, "message", "msg", IDDirection::Ascending)?;
-    let data = json!({ "role": role, "time": { "created": now } });
-    tx.execute(
-        "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?1, ?2, ?3, ?3, ?4)",
-        params![&mid, session_id, now, serde_json::to_string(&data).unwrap_or_default()],
-    )
-    .map_err(|e| format!("insert message: {e}"))?;
-    Ok(mid)
-}
-
 fn insert_part(
     tx: &Connection,
     session_id: &str,
@@ -335,23 +338,6 @@ fn insert_part(
         params![&pid, message_id, session_id, now, serde_json::to_string(&data).unwrap_or_default()],
     )
     .map_err(|e| format!("insert part: {e}"))?;
-    Ok(())
-}
-
-fn close_message(
-    tx: &Connection,
-    pending_msg: &mut Option<String>,
-    _pending_role: &mut Option<String>,
-    session_id: &str,
-    now: i64,
-) -> Result<(), String> {
-    if let Some(mid) = pending_msg.take() {
-        tx.execute(
-            "UPDATE message SET time_updated = ?1 WHERE id = ?2 AND session_id = ?3",
-            params![now, mid, session_id],
-        )
-        .map_err(|e| format!("update message: {e}"))?;
-    }
     Ok(())
 }
 

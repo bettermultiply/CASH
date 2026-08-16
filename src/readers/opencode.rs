@@ -58,6 +58,7 @@ pub fn read(db_path: &Path, session_id: &str) -> Result<Trace, String> {
     let file_hash = sha256_hex(&raw);
 
     let mut events: Vec<Event> = Vec::new();
+    let mut prev_msg_id: Option<String> = None;
 
     for msg in conn
         .prepare("SELECT id, data, time_created FROM message WHERE session_id = ?1 ORDER BY time_created, id")
@@ -67,23 +68,36 @@ pub fn read(db_path: &Path, session_id: &str) -> Result<Trace, String> {
         })
         .map_err(|e| e.to_string())?
     {
-        let (msg_id, msg_data, msg_time) = msg.map_err(|e| e.to_string())?;
+        let (msg_id, msg_data, _msg_time) = msg.map_err(|e| e.to_string())?;
         let mv: Value = serde_json::from_str(&msg_data).map_err(|e| format!("bad message json: {e}"))?;
         let role = mv.get("role").and_then(Value::as_str).unwrap_or("");
+        let parent = prev_msg_id.clone();
 
-        // Collect this message's parts in order.
-        let parts: Vec<(String, i64)> = conn
-            .prepare("SELECT data, time_created FROM part WHERE message_id = ?1 ORDER BY time_created, id")
+        let part_rows: Vec<(String, String)> = conn
+            .prepare("SELECT id, data FROM part WHERE message_id = ?1 ORDER BY time_created, id")
             .map_err(|e| e.to_string())?
-            .query_map([&msg_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+            .query_map([&msg_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
             .map_err(|e| e.to_string())?
             .collect::<Result<_, _>>()
             .map_err(|e| e.to_string())?;
 
-        for (part_data, part_time) in parts {
-            let pv: Value = serde_json::from_str(&part_data).map_err(|e| format!("bad part json: {e}"))?;
+        let mut parts: Vec<(String, i64, Value)> = Vec::new();
+        for (pid, pdata) in part_rows {
+            let parsed: Value =
+                serde_json::from_str(&pdata).map_err(|e| format!("bad part json: {e}"))?;
+            let ptime = parsed
+                .get("time")
+                .and_then(Value::as_object)
+                .and_then(|t| t.get("end"))
+                .and_then(Value::as_i64)
+                .unwrap_or(_msg_time);
+            parts.push((pid, ptime, parsed));
+        }
+
+        for (_pid, part_time, pv) in parts {
             let ptype = pv.get("type").and_then(Value::as_str).unwrap_or("");
             let time = Some(part_time);
+            // All parts of a message share the message id as original_id.
             match ptype {
                 "text" => {
                     let text = pv.get("text").and_then(Value::as_str).unwrap_or_default().to_string();
@@ -92,14 +106,23 @@ pub fn read(db_path: &Path, session_id: &str) -> Result<Trace, String> {
                             "user" => EventKind::UserMessage { text },
                             _ => EventKind::AssistantMessage { text },
                         };
-                        events.push(Event { time, kind });
+                        events.push(Event {
+                            original_id: msg_id.clone(),
+                            parent_original_id: parent.clone(),
+                            time,
+                            native: Some(mv.clone()),
+                            kind,
+                        });
                     }
                 }
                 "reasoning" => {
                     let text = pv.get("text").and_then(Value::as_str).unwrap_or_default().to_string();
                     if !text.is_empty() {
                         events.push(Event {
+                            original_id: msg_id.clone(),
+                            parent_original_id: parent.clone(),
                             time,
+                            native: Some(mv.clone()),
                             kind: EventKind::Reasoning { text },
                         });
                     }
@@ -124,7 +147,10 @@ pub fn read(db_path: &Path, session_id: &str) -> Result<Trace, String> {
                     let is_error = status == "error" && output.is_empty();
 
                     events.push(Event {
+                        original_id: msg_id.clone(),
+                        parent_original_id: parent.clone(),
                         time,
+                        native: Some(mv.clone()),
                         kind: EventKind::ToolCall {
                             id: call_id.clone(),
                             name,
@@ -132,7 +158,10 @@ pub fn read(db_path: &Path, session_id: &str) -> Result<Trace, String> {
                         },
                     });
                     events.push(Event {
+                        original_id: msg_id.clone(),
+                        parent_original_id: parent.clone(),
                         time,
+                        native: Some(mv.clone()),
                         kind: EventKind::ToolResult {
                             call_id,
                             output,
@@ -141,10 +170,11 @@ pub fn read(db_path: &Path, session_id: &str) -> Result<Trace, String> {
                         },
                     });
                 }
+                // step-start / step-finish are UI markers; not part of the trace.
                 _ => {}
             }
         }
-        let _ = msg_time;
+        prev_msg_id = Some(msg_id);
     }
 
     let meta = TraceMeta {

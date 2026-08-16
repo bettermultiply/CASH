@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::ir::{AgentKind, Event, EventKind, Trace, TraceMeta};
 use crate::util::{parse_ts, sha256_hex};
@@ -36,6 +36,12 @@ pub fn read(path: &Path) -> Result<Trace, String> {
             .get("timestamp")
             .and_then(|x| x.as_str())
             .and_then(parse_ts);
+        let entry_id = v
+            .get("payload")
+            .and_then(|p| p.get("id"))
+            .and_then(Value::as_str)
+            .map(String::from)
+            .unwrap_or_else(|| format!("rec_{i:05}"));
         match t {
             "session_meta" => {
                 let p = &v["payload"];
@@ -57,6 +63,7 @@ pub fn read(path: &Path) -> Result<Trace, String> {
             "response_item" => {
                 let p = &v["payload"];
                 let ptype = p.get("type").and_then(Value::as_str).unwrap_or("");
+                let native = codex_native(p);
                 match ptype {
                     "message" => {
                         let text = collect_text(&p["content"]);
@@ -66,7 +73,13 @@ pub fn read(path: &Path) -> Result<Trace, String> {
                                 "user" | "developer" => EventKind::UserMessage { text },
                                 _ => EventKind::AssistantMessage { text },
                             };
-                            events.push(Event { time: ts, kind: ev });
+                            events.push(Event {
+                                original_id: entry_id,
+                                parent_original_id: None,
+                                time: ts,
+                                native,
+                                kind: ev,
+                            });
                         }
                     }
                     "function_call" | "custom_tool_call" => {
@@ -92,7 +105,10 @@ pub fn read(path: &Path) -> Result<Trace, String> {
                                 .unwrap_or_default()
                         };
                         events.push(Event {
+                            original_id: entry_id,
+                            parent_original_id: None,
                             time: ts,
+                            native,
                             kind: EventKind::ToolCall {
                                 id,
                                 name,
@@ -112,7 +128,10 @@ pub fn read(path: &Path) -> Result<Trace, String> {
                             .map(String::from)
                             .unwrap_or_else(|| collect_text(&p["output"]));
                         events.push(Event {
+                            original_id: entry_id,
+                            parent_original_id: None,
                             time: ts,
+                            native,
                             kind: EventKind::ToolResult {
                                 call_id,
                                 output,
@@ -125,12 +144,26 @@ pub fn read(path: &Path) -> Result<Trace, String> {
                         let text = collect_text(&p["summary"]);
                         if !text.is_empty() {
                             events.push(Event {
+                                original_id: entry_id,
+                                parent_original_id: None,
                                 time: ts,
+                                native,
                                 kind: EventKind::Reasoning { text },
                             });
                         }
                     }
-                    _ => {}
+                    // Unmodeled response_item: preserve verbatim so nothing is lost.
+                    other => {
+                        events.push(Event {
+                            original_id: entry_id,
+                            parent_original_id: None,
+                            time: ts,
+                            native: Some(v.clone()),
+                            kind: EventKind::NativeRecord {
+                                record_type: other.into(),
+                            },
+                        });
+                    }
                 }
             }
             "event_msg" => {
@@ -142,6 +175,8 @@ pub fn read(path: &Path) -> Result<Trace, String> {
                     meta.ended_at = ts;
                 }
             }
+            // session_meta / turn_context / event_msg / world_state are infra
+            // telemetry, not user content; they are not part of the event trace.
             _ => {}
         }
     }
@@ -154,6 +189,15 @@ pub fn read(path: &Path) -> Result<Trace, String> {
     }
     finish_meta(&mut meta, &events);
     Ok(Trace { meta, events })
+}
+
+/// Native-only metadata of a Codex response_item: the turn linkage and any
+/// per-item extras, kept so extraction loses nothing.
+fn codex_native(payload: &Value) -> Option<Value> {
+    payload
+        .get("internal_chat_message_metadata_passthrough")
+        .cloned()
+        .map(|v| json!({ "internal": v }))
 }
 
 /// Recursively list rollout JSONL files under a sessions root.

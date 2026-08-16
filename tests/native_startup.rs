@@ -11,15 +11,14 @@ fn opencode_cli_can_list_and_export_imported_session() {
         return;
     }
 
-    let tmp =
-        std::env::temp_dir().join(format!("cash-native-{}", uuid::Uuid::new_v4().simple()));
+    let tmp = std::env::temp_dir().join(format!("cash-native-{}", uuid::Uuid::new_v4().simple()));
     let xdg = tmp.join("xdg-data");
     let opencode_dir = xdg.join("opencode");
     std::fs::create_dir_all(&opencode_dir).unwrap();
 
     let source_db = config::home_dir().join(".local/share/opencode/opencode.db");
     let db = opencode_dir.join("opencode.db");
-    std::fs::copy(&source_db, &db).expect("copy opencode db into temp XDG dir");
+    copy_opencode_db(&source_db, &db);
 
     let trace = readers::pi::read(&fixture("real/pi_real_sanitized.jsonl")).unwrap();
     let result = import::opencode::import(&trace, &db).expect("import into temp opencode db");
@@ -67,10 +66,8 @@ fn pi_cli_can_export_imported_session() {
         return;
     }
 
-    let tmp = std::env::temp_dir().join(format!(
-        "cash-native-pi-{}",
-        uuid::Uuid::new_v4().simple()
-    ));
+    let tmp =
+        std::env::temp_dir().join(format!("cash-native-pi-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&tmp).unwrap();
 
     let trace = readers::pi::read(&fixture("real/pi_real_sanitized.jsonl")).unwrap();
@@ -138,6 +135,81 @@ fn pi_tui_starts_imported_session_without_uncaught_exception() {
     );
 
     let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+#[ignore = "requires codex CLI, a copied CODEX_HOME, and one real model call"]
+fn codex_cli_resumes_imported_session() {
+    if Command::new("codex").arg("--version").output().is_err() {
+        eprintln!("codex not found; skipping native startup test");
+        return;
+    }
+    let tmp = std::env::temp_dir().join(format!(
+        "cash-native-codex-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let codex_home = tmp.join(".codex");
+    copy_dir(&config::home_dir().join(".codex"), &codex_home);
+
+    let trace = readers::pi::read(&fixture("real/pi_real_sanitized.jsonl")).unwrap();
+    let result = import::codex::import(&trace, &codex_home.join("sessions")).expect("import codex");
+
+    let mut child = Command::new("codex")
+        .args(["exec", "resume", &result.session_id, "-", "--json"])
+        .env("CODEX_HOME", &codex_home)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("run codex resume");
+    use std::io::Write;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"Reply with exactly: OK")
+        .unwrap();
+    let output = child.wait_with_output().expect("wait for codex");
+    assert!(
+        output.status.success(),
+        "codex resume failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("agent_message"),
+        "no agent response:\n{stdout}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+fn copy_dir(from: &Path, to: &Path) {
+    if !from.exists() {
+        return;
+    }
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap().flatten() {
+        let src = entry.path();
+        let dst = to.join(entry.file_name());
+        if src.is_dir() {
+            copy_dir(&src, &dst);
+        } else {
+            let _ = std::fs::copy(&src, &dst);
+        }
+    }
+}
+
+/// Copy an OpenCode store consistently (live WAL may not be in the main .db).
+fn copy_opencode_db(src: &Path, dst: &Path) {
+    let conn = rusqlite::Connection::open(src).expect("open source opencode db");
+    conn.execute_batch(&format!(
+        "VACUUM INTO '{}'",
+        dst.to_string_lossy().replace('\'', "''")
+    ))
+    .expect("vacuum into destination db");
+    drop(conn);
 }
 
 fn opencode<const N: usize>(xdg: &Path, args: [&str; N]) -> std::process::Output {

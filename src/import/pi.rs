@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::Path;
 
@@ -10,12 +10,15 @@ use crate::ir::{EventKind, Trace};
 
 /// Write a trace into Pi Agent's native JSONL session layout.
 pub fn import(trace: &Trace, sessions_root: &Path) -> Result<ImportResult, String> {
-    import_existing(trace, sessions_root, None, None, None, false)
+    import_existing(trace, sessions_root, None, None, None, false, None)
 }
 
 /// Write a trace into Pi Agent storage, reusing an existing target binding when
 /// present. The existing file is replaced atomically; a target that continued
 /// after the recorded anchor requires `force` to overwrite.
+///
+/// `model_override` replaces the model used for assistant message metadata in
+/// the normalized path; it does not rewrite a verbatim same-agent replay.
 pub fn import_existing(
     trace: &Trace,
     sessions_root: &Path,
@@ -23,6 +26,7 @@ pub fn import_existing(
     existing_session_id: Option<&str>,
     existing_anchor: Option<&str>,
     force: bool,
+    model_override: Option<&str>,
 ) -> Result<ImportResult, String> {
     let now = chrono::Utc::now().timestamp_millis();
     let session_id = existing_session_id
@@ -35,12 +39,15 @@ pub fn import_existing(
         .unwrap_or_else(|| dir.join(format!("{}_{}.jsonl", file_timestamp(now), session_id)));
 
     if let Some(anchor) = existing_anchor
-        && file.exists() && !force && has_records_after_anchor(&file, anchor)? {
-            return Err(format!(
-                "target Pi session continued after anchor; refusing to overwrite {} (use --force to replace it)",
-                file.display()
-            ));
-        }
+        && file.exists()
+        && !force
+        && has_records_after_anchor(&file, anchor)?
+    {
+        return Err(format!(
+            "target Pi session continued after anchor; refusing to overwrite {} (use --force to replace it)",
+            file.display()
+        ));
+    }
     if existing_file.is_some() && !file.exists() && !force {
         return Err(format!(
             "target Pi session file is missing: {} (use --force to recreate it)",
@@ -56,125 +63,58 @@ pub fn import_existing(
     let mut writer = std::fs::File::create(&temporary)
         .map_err(|e| format!("create {}: {e}", temporary.display()))?;
 
-    let session_line = json!({
-        "type": "session",
-        "version": 3,
-        "id": session_id,
-        "timestamp": rfc3339_ms(now),
-        "cwd": cwd,
-    });
-    write_jsonl(&mut writer, &session_line)?;
+    // Events are the single representation. Consecutive events sharing an
+    // original_id come from the same native record and are grouped back into a
+    // single Pi entry. original_id / parent_original_id are reused as the native
+    // ids, and native-only metadata (usage, responseId, ...) is written back, so
+    // a same-agent round trip keeps the information.
+    let (anchor, message_count) = {
+        let header = json!({
+            "type": "session",
+            "version": 3,
+            "id": session_id,
+            "timestamp": rfc3339_ms(now),
+            "cwd": cwd,
+        });
+        write_jsonl(&mut writer, &header)?;
 
-    let mut parent_id: Option<String> = None;
-    let mut anchor = String::new();
-    let mut message_count = 0usize;
-    let mut used_ids = HashSet::new();
-    let mut tool_names: HashMap<String, String> = HashMap::new();
-    let mut current_provider = "cash".to_string();
-    let mut current_model = trace.meta.model.clone().unwrap_or_else(|| "cash".into());
-
-    for ev in &trace.events {
-        let id = short_id(&mut used_ids);
-        let ts = ev.time.unwrap_or(now);
-        let line = match &ev.kind {
-            EventKind::ModelChange { provider, model } => json!({
-                "type": "model_change",
-                "id": id,
-                "parentId": parent_id,
-                "timestamp": rfc3339_ms(ts),
-                "provider": provider.clone().unwrap_or_default(),
-                "modelId": model.clone().unwrap_or_default(),
-            }),
-            EventKind::UserMessage { text } => pi_message(
-                &id,
-                parent_id.as_deref(),
-                ts,
-                json!({
-                    "role": "user",
-                    "content": [{"type": "text", "text": text}],
-                    "timestamp": ts,
-                }),
-            ),
-            EventKind::AssistantMessage { text } => pi_message(
-                &id,
-                parent_id.as_deref(),
-                ts,
-                assistant_message(
-                    &current_provider,
-                    &current_model,
-                    "stop",
-                    ts,
-                    json!([{"type": "text", "text": text}]),
-                ),
-            ),
-            EventKind::Reasoning { text } => pi_message(
-                &id,
-                parent_id.as_deref(),
-                ts,
-                assistant_message(
-                    &current_provider,
-                    &current_model,
-                    "stop",
-                    ts,
-                    json!([{"type": "thinking", "thinking": text, "thinkingSignature": "cash"}]),
-                ),
-            ),
-            EventKind::ToolCall {
-                id: call_id,
-                name,
-                arguments,
-            } => {
-                tool_names.insert(call_id.clone(), name.clone());
-                let args = serde_json::from_str::<Value>(arguments)
-                    .unwrap_or(Value::String(arguments.clone()));
-                pi_message(
-                    &id,
-                    parent_id.as_deref(),
-                    ts,
-                    assistant_message(
-                        &current_provider,
-                        &current_model,
-                        "toolUse",
-                        ts,
-                        json!([{"type": "toolCall", "id": call_id, "name": name, "arguments": args}]),
-                    ),
-                )
+        let mut anchor = String::new();
+        let mut message_count = 0usize;
+        let mut parent_id: Option<String> = None;
+        let mut used_ids: HashSet<String> = HashSet::new();
+        let mut i = 0usize;
+        while i < trace.events.len() {
+            let oid = trace.events[i].original_id.clone();
+            let mut j = i;
+            while j < trace.events.len() && trace.events[j].original_id == oid {
+                j += 1;
             }
-            EventKind::ToolResult {
-                call_id, output, ..
-            } => {
-                let tool_name = tool_names
-                    .get(call_id)
-                    .cloned()
-                    .unwrap_or_else(|| "tool".into());
-                pi_message(
-                    &id,
-                    parent_id.as_deref(),
-                    ts,
-                    json!({
-                        "role": "toolResult",
-                        "toolCallId": call_id,
-                        "toolName": tool_name,
-                        "content": [{"type": "text", "text": output}],
-                        "timestamp": ts,
-                    }),
-                )
+            let group = &trace.events[i..j];
+            for mut entry in render_group(group, now, model_override, parent_id.as_deref()) {
+                // Distinct native records must not share an entry id; when the
+                // source reuses one original_id (e.g. OpenCode tool call+result)
+                // disambiguate the derived Pi ids.
+                let base = entry
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let mut id = base.clone();
+                let mut n = 2;
+                while !used_ids.insert(id.clone()) {
+                    id = format!("{base}_{n}");
+                    n += 1;
+                }
+                entry["id"] = json!(id);
+                write_jsonl(&mut writer, &entry)?;
+                anchor = id.clone();
+                parent_id = Some(id);
+                message_count += 1;
             }
-        };
-        write_jsonl(&mut writer, &line)?;
-        parent_id = Some(id.clone());
-        anchor = id;
-        message_count += 1;
-
-        if let EventKind::ModelChange { provider, model } = &ev.kind {
-            if let Some(provider) = provider {
-                current_provider = provider.clone();
-            }
-            if let Some(model) = model {
-                current_model = model.clone();
-            }
+            i = j;
         }
-    }
+        (anchor, message_count)
+    };
 
     writer
         .sync_all()
@@ -189,7 +129,6 @@ pub fn import_existing(
         dropped_event_count: 0,
     })
 }
-
 pub fn has_records_after_anchor(path: &Path, anchor: &str) -> Result<bool, String> {
     let raw = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let mut found = false;
@@ -204,6 +143,244 @@ pub fn has_records_after_anchor(path: &Path, anchor: &str) -> Result<bool, Strin
         }
     }
     Ok(!found)
+}
+
+/// Render one group of events (sharing an original_id) back into Pi entries.
+/// A tool result becomes its own record even when it shares an original_id with
+/// the tool call (Pi stores them as separate records).
+fn render_group(
+    group: &[crate::ir::Event],
+    now: i64,
+    model_override: Option<&str>,
+    parent: Option<&str>,
+) -> Vec<Value> {
+    let id = group[0].original_id.clone();
+    let parent_id = group[0]
+        .parent_original_id
+        .clone()
+        .or_else(|| parent.map(str::to_owned));
+    let ts = group.iter().find_map(|e| e.time).unwrap_or(now);
+    // Pi-shaped native metadata: the message object minus its content array.
+    let native = group
+        .iter()
+        .find_map(|e| e.native.as_ref().filter(|n| n.get("role").is_some()));
+
+    // Single native record preserved verbatim.
+    if group.len() == 1
+        && let EventKind::NativeRecord { .. } = &group[0].kind
+        && let Some(n) = group[0].native.as_ref()
+        && n.get("type").and_then(Value::as_str).is_some()
+        && n.get("id").and_then(Value::as_str).is_some()
+    {
+        return vec![n.clone()];
+    }
+
+    // A tool result is always its own Pi record; the tool call (and any text or
+    // thinking in the same native message) becomes a separate assistant message.
+    let tool_results: Vec<&crate::ir::Event> = group
+        .iter()
+        .filter(|e| matches!(e.kind, EventKind::ToolResult { .. }))
+        .collect();
+    if !tool_results.is_empty() {
+        let tool_name = group
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::ToolCall { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| "tool".into());
+        let mut out = Vec::new();
+
+        let rest: Vec<&crate::ir::Event> = group
+            .iter()
+            .filter(|e| !matches!(e.kind, EventKind::ToolResult { .. }))
+            .collect();
+        if !rest.is_empty() {
+            let blocks = assistant_blocks(&rest);
+            let mut message = native
+                .cloned()
+                .unwrap_or_else(|| json!({ "role": "assistant" }));
+            message["content"] = json!(blocks);
+            if message.get("timestamp").is_none() {
+                message["timestamp"] = json!(ts);
+            }
+            ensure_assistant_required_fields(&mut message);
+            out.push(pi_message(&id, parent_id.as_deref(), ts, message));
+        }
+
+        for event in tool_results {
+            let EventKind::ToolResult {
+                call_id, output, ..
+            } = &event.kind
+            else {
+                continue;
+            };
+            let event_ts = event.time.unwrap_or(ts);
+            let mut message = native
+                .cloned()
+                .unwrap_or_else(|| json!({ "role": "toolResult" }));
+            message["role"] = json!("toolResult");
+            message["content"] = json!([{ "type": "text", "text": output }]);
+            if message.get("toolCallId").is_none() {
+                message["toolCallId"] = json!(call_id);
+            }
+            if message.get("toolName").is_none() {
+                message["toolName"] = json!(tool_name);
+            }
+            if message.get("timestamp").is_none() {
+                message["timestamp"] = json!(event_ts);
+            }
+            out.push(pi_message(
+                &event.original_id,
+                parent_id.as_deref(),
+                event_ts,
+                message,
+            ));
+        }
+        return out;
+    }
+
+    if group.len() == 1
+        && let EventKind::ModelChange { provider, model } = &group[0].kind
+    {
+        return vec![json!({
+            "type": "model_change",
+            "id": id,
+            "parentId": parent_id,
+            "timestamp": rfc3339_ms(ts),
+            "provider": provider.clone().unwrap_or_default(),
+            "modelId": model.clone().unwrap_or_default(),
+        })];
+    }
+
+    if group.len() == 1
+        && let EventKind::UserMessage { text } = &group[0].kind
+    {
+        let mut message = native.cloned().unwrap_or_else(|| json!({ "role": "user" }));
+        message["content"] = json!([{ "type": "text", "text": text }]);
+        if message.get("timestamp").is_none() {
+            message["timestamp"] = json!(ts);
+        }
+        return vec![pi_message(&id, parent_id.as_deref(), ts, message)];
+    }
+
+    // Assistant group: reassemble content blocks in order.
+    let mut blocks: Vec<Value> = Vec::new();
+    for event in group {
+        match &event.kind {
+            EventKind::AssistantMessage { text } => {
+                blocks.push(json!({ "type": "text", "text": text }));
+            }
+            EventKind::Reasoning { text } => {
+                blocks.push(
+                    json!({ "type": "thinking", "thinking": text, "thinkingSignature": "cash" }),
+                );
+            }
+            EventKind::ToolCall {
+                id: call_id,
+                name,
+                arguments,
+            } => {
+                let args = serde_json::from_str::<Value>(arguments)
+                    .unwrap_or(Value::String(arguments.clone()));
+                blocks.push(json!({
+                    "type": "toolCall",
+                    "id": call_id,
+                    "name": name,
+                    "arguments": args,
+                }));
+            }
+            EventKind::NativeRecord { .. } => {
+                // Unmodeled content block: keep the whole message verbatim.
+                if let Some(n) = event.native.as_ref().filter(|n| n.get("message").is_some()) {
+                    return vec![n.clone()];
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut message = if let Some(native) = native {
+        native.clone()
+    } else {
+        let model = model_override
+            .map(str::to_owned)
+            .unwrap_or_else(|| "cash".into());
+        assistant_message("cash", &model, "stop", ts, json!([]))
+    };
+    if let Some(model) = model_override {
+        message["model"] = json!(model);
+    }
+    message["content"] = json!(blocks);
+    if message.get("timestamp").is_none() {
+        message["timestamp"] = json!(ts);
+    }
+    ensure_assistant_required_fields(&mut message);
+    vec![pi_message(&id, parent_id.as_deref(), ts, message)]
+}
+
+/// Build Pi content blocks from assistant events (text / thinking / toolCall).
+fn assistant_blocks(events: &[&crate::ir::Event]) -> Vec<Value> {
+    let mut blocks: Vec<Value> = Vec::new();
+    for event in events {
+        match &event.kind {
+            EventKind::AssistantMessage { text } => {
+                blocks.push(json!({ "type": "text", "text": text }));
+            }
+            EventKind::Reasoning { text } => {
+                blocks.push(
+                    json!({ "type": "thinking", "thinking": text, "thinkingSignature": "cash" }),
+                );
+            }
+            EventKind::ToolCall {
+                id: call_id,
+                name,
+                arguments,
+            } => {
+                let args = serde_json::from_str::<Value>(arguments)
+                    .unwrap_or(Value::String(arguments.clone()));
+                blocks.push(json!({
+                    "type": "toolCall",
+                    "id": call_id,
+                    "name": name,
+                    "arguments": args,
+                }));
+            }
+            _ => {}
+        }
+    }
+    blocks
+}
+
+/// Pi's TUI reads usage unconditionally; make sure an assistant message always
+/// carries the required metadata even when the source never recorded it.
+fn ensure_assistant_required_fields(message: &mut Value) {
+    let obj = message.as_object_mut().expect("message is an object");
+    if !obj.contains_key("usage") {
+        obj.insert(
+            "usage".into(),
+            json!({
+                "input": 0,
+                "output": 0,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "totalTokens": 0,
+                "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 }
+            }),
+        );
+    }
+    if !obj.contains_key("stopReason") {
+        obj.insert("stopReason".into(), json!("stop"));
+    }
+    if !obj.contains_key("api") {
+        obj.insert("api".into(), json!("cash"));
+    }
+    if !obj.contains_key("provider") {
+        obj.insert("provider".into(), json!("cash"));
+    }
+    if !obj.contains_key("model") {
+        obj.insert("model".into(), json!("cash"));
+    }
 }
 
 fn pi_message(id: &str, parent_id: Option<&str>, ts: i64, message: Value) -> Value {
@@ -270,16 +447,4 @@ fn rfc3339_ms(ms: i64) -> String {
     chrono::DateTime::from_timestamp_millis(ms)
         .map(|d| d.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
         .unwrap_or_else(|| chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
-}
-
-fn short_id(used: &mut HashSet<String>) -> String {
-    for _ in 0..100 {
-        let id = Uuid::new_v4().simple().to_string()[..8].to_string();
-        if used.insert(id.clone()) {
-            return id;
-        }
-    }
-    let id = Uuid::new_v4().to_string();
-    used.insert(id.clone());
-    id
 }

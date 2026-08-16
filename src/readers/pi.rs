@@ -36,6 +36,12 @@ pub fn read(path: &Path) -> Result<Trace, String> {
             .get("timestamp")
             .and_then(Value::as_str)
             .and_then(crate::util::parse_ts);
+        let entry_id = v
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let parent_id = v.get("parentId").and_then(Value::as_str).map(String::from);
         match t {
             "session" => {
                 meta.session_id = v
@@ -51,7 +57,10 @@ pub fn read(path: &Path) -> Result<Trace, String> {
                 let model = v.get("modelId").and_then(Value::as_str).map(String::from);
                 meta.model = model.clone().or(provider.clone());
                 events.push(Event {
+                    original_id: entry_id,
+                    parent_original_id: parent_id,
                     time: ts,
+                    native: None,
                     kind: EventKind::ModelChange { provider, model },
                 });
             }
@@ -63,18 +72,26 @@ pub fn read(path: &Path) -> Result<Trace, String> {
                     .and_then(Value::as_array)
                     .cloned()
                     .unwrap_or_default();
+                // Native-only metadata (usage, model, responseId, ...) minus the
+                // content array, which is captured by the typed events below.
+                let native = message_native(m);
                 match role {
                     "user" => {
                         let text = join_text(&content);
                         if !text.is_empty() {
                             events.push(Event {
+                                original_id: entry_id.clone(),
+                                parent_original_id: parent_id.clone(),
                                 time: ts.or(m.get("timestamp").and_then(Value::as_i64)),
+                                native: native.clone(),
                                 kind: EventKind::UserMessage { text },
                             });
                         }
                     }
                     "assistant" => {
+                        let mut modeled = false;
                         for item in &content {
+                            let time = ts;
                             match item.get("type").and_then(Value::as_str).unwrap_or("") {
                                 "text" => {
                                     let text = item
@@ -82,8 +99,12 @@ pub fn read(path: &Path) -> Result<Trace, String> {
                                         .and_then(Value::as_str)
                                         .unwrap_or_default();
                                     if !text.is_empty() {
+                                        modeled = true;
                                         events.push(Event {
-                                            time: ts,
+                                            original_id: entry_id.clone(),
+                                            parent_original_id: parent_id.clone(),
+                                            time,
+                                            native: native.clone(),
                                             kind: EventKind::AssistantMessage {
                                                 text: text.to_string(),
                                             },
@@ -96,8 +117,12 @@ pub fn read(path: &Path) -> Result<Trace, String> {
                                         .and_then(Value::as_str)
                                         .unwrap_or_default();
                                     if !text.is_empty() {
+                                        modeled = true;
                                         events.push(Event {
-                                            time: ts,
+                                            original_id: entry_id.clone(),
+                                            parent_original_id: parent_id.clone(),
+                                            time,
+                                            native: native.clone(),
                                             kind: EventKind::Reasoning {
                                                 text: text.to_string(),
                                             },
@@ -119,8 +144,12 @@ pub fn read(path: &Path) -> Result<Trace, String> {
                                         .get("arguments")
                                         .map(|a| serde_json::to_string(a).unwrap_or_default())
                                         .unwrap_or_default();
+                                    modeled = true;
                                     events.push(Event {
-                                        time: ts,
+                                        original_id: entry_id.clone(),
+                                        parent_original_id: parent_id.clone(),
+                                        time,
+                                        native: native.clone(),
                                         kind: EventKind::ToolCall {
                                             id,
                                             name,
@@ -128,8 +157,34 @@ pub fn read(path: &Path) -> Result<Trace, String> {
                                         },
                                     });
                                 }
-                                _ => {}
+                                // Unmodeled content block: keep the whole message
+                                // verbatim so nothing is lost.
+                                _ => {
+                                    events.push(Event {
+                                        original_id: entry_id.clone(),
+                                        parent_original_id: parent_id.clone(),
+                                        time,
+                                        native: Some(v.clone()),
+                                        kind: EventKind::NativeRecord {
+                                            record_type: "content_block".into(),
+                                        },
+                                    });
+                                    modeled = true;
+                                }
                             }
+                        }
+                        // Empty assistant message (e.g. an error stub): keep the
+                        // record so the session shape is preserved.
+                        if !modeled {
+                            events.push(Event {
+                                original_id: entry_id.clone(),
+                                parent_original_id: parent_id.clone(),
+                                time: ts,
+                                native: Some(v.clone()),
+                                kind: EventKind::NativeRecord {
+                                    record_type: "message".into(),
+                                },
+                            });
                         }
                     }
                     "toolResult" => {
@@ -140,7 +195,10 @@ pub fn read(path: &Path) -> Result<Trace, String> {
                             .to_string();
                         let output = join_text(&content);
                         events.push(Event {
+                            original_id: entry_id.clone(),
+                            parent_original_id: parent_id.clone(),
                             time: ts,
+                            native,
                             kind: EventKind::ToolResult {
                                 call_id,
                                 output,
@@ -149,10 +207,33 @@ pub fn read(path: &Path) -> Result<Trace, String> {
                             },
                         });
                     }
-                    _ => {}
+                    _ => {
+                        // user-adjacent roles or unknown message shapes: keep verbatim.
+                        events.push(Event {
+                            original_id: entry_id.clone(),
+                            parent_original_id: parent_id.clone(),
+                            time: ts,
+                            native: Some(v.clone()),
+                            kind: EventKind::NativeRecord {
+                                record_type: "message".into(),
+                            },
+                        });
+                    }
                 }
             }
-            _ => {}
+            // Entries with no cross-agent semantic (labels, compaction,
+            // thinking_level_change, custom entries, ...): preserve verbatim.
+            other => {
+                events.push(Event {
+                    original_id: entry_id,
+                    parent_original_id: parent_id,
+                    time: ts,
+                    native: Some(v.clone()),
+                    kind: EventKind::NativeRecord {
+                        record_type: other.into(),
+                    },
+                });
+            }
         }
     }
 
@@ -164,6 +245,18 @@ pub fn read(path: &Path) -> Result<Trace, String> {
     }
     crate::util::finish_meta(&mut meta, &events);
     Ok(Trace { meta, events })
+}
+
+/// Native-only metadata of a Pi message: everything except the content array,
+/// so usage/model/responseId/... survive extraction without duplicating text.
+fn message_native(message: &Value) -> Option<Value> {
+    let mut map = message.as_object()?.clone();
+    map.remove("content");
+    if map.is_empty() {
+        None
+    } else {
+        Some(Value::Object(map))
+    }
 }
 
 /// Recursively list session JSONL files under a Pi sessions root.

@@ -1,7 +1,6 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use clap::{Parser, Subcommand};
 use cash::config;
 use cash::export;
 use cash::import;
@@ -10,13 +9,10 @@ use cash::ir::AgentKind;
 use cash::readers;
 use cash::sync;
 use cash::util;
+use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(
-    name = "cash",
-    about = "CASH — Cross-Agent Session History",
-    version
-)]
+#[command(name = "cash", about = "CASH — Cross-Agent Session History", version)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -62,6 +58,8 @@ enum Command {
         opencode_db: Option<PathBuf>,
         #[arg(long)]
         force: bool,
+        #[arg(long)]
+        model: Option<String>,
     },
     /// Materialize a CASH seed into native agent storage
     Import {
@@ -69,11 +67,15 @@ enum Command {
         #[arg(short, long)]
         seed: Option<PathBuf>,
         #[arg(long)]
+        codex_root: Option<PathBuf>,
+        #[arg(long)]
         pi_root: Option<PathBuf>,
         #[arg(long)]
         opencode_db: Option<PathBuf>,
         #[arg(long)]
         force: bool,
+        #[arg(long)]
+        model: Option<String>,
     },
     /// Inspect source and target state recorded by a CASH seed
     Status {
@@ -181,21 +183,28 @@ fn run(cli: Cli) -> Result<(), String> {
         Command::Import {
             agent,
             seed,
+            codex_root,
             pi_root,
             opencode_db,
             force,
+            model,
         } => {
             let kind = parse_agent(&agent)?;
             let seed = resolve_seed_dir(seed)?;
             let db = opencode_db.unwrap_or_else(default_opencode_db);
             let trace = load_trace(&seed)?;
+            warn_model_override(&trace, model.as_deref());
             let result = import_and_update_manifest(
                 kind,
                 &trace,
                 &seed,
-                &db,
-                &pi_root.unwrap_or_else(default_pi_root),
-                force,
+                ImportOptions {
+                    codex_root: codex_root.unwrap_or_else(default_codex_root),
+                    pi_root: pi_root.unwrap_or_else(default_pi_root),
+                    opencode_db: db,
+                    force,
+                    model_override: model,
+                },
             )?;
             print_import_result(kind, &seed, &result);
             Ok(())
@@ -209,12 +218,13 @@ fn run(cli: Cli) -> Result<(), String> {
             pi_root,
             opencode_db,
             force,
+            model,
         } => {
             let source_kind = parse_agent(&source_agent)?;
             let target_kind = parse_agent(&target_agent)?;
             let db = opencode_db.unwrap_or_else(default_opencode_db);
             let source_root = match source_kind {
-                AgentKind::Codex => codex_root.unwrap_or_else(default_codex_root),
+                AgentKind::Codex => codex_root.clone().unwrap_or_else(default_codex_root),
                 AgentKind::Pi => pi_root.clone().unwrap_or_else(default_pi_root),
                 AgentKind::OpenCode => default_codex_root(),
             };
@@ -233,13 +243,18 @@ fn run(cli: Cli) -> Result<(), String> {
             println!("exported seed to {}", seed.display());
             println!("  source events_sha256: {}", manifest.source.events_sha256);
 
+            warn_model_override(&trace, model.as_deref());
             let result = import_and_update_manifest(
                 target_kind,
                 &trace,
                 &seed,
-                &db,
-                &pi_root.unwrap_or_else(default_pi_root),
-                force,
+                ImportOptions {
+                    codex_root: codex_root.unwrap_or_else(default_codex_root),
+                    pi_root: pi_root.unwrap_or_else(default_pi_root),
+                    opencode_db: db,
+                    force,
+                    model_override: model,
+                },
             )?;
             print_import_result(target_kind, &seed, &result);
             Ok(())
@@ -292,36 +307,53 @@ fn load_trace(seed_dir: &Path) -> Result<ir::Trace, String> {
     serde_json::from_str(&raw).map_err(|e| format!("parse {}: {e}", p.display()))
 }
 
+struct ImportOptions {
+    codex_root: PathBuf,
+    pi_root: PathBuf,
+    opencode_db: PathBuf,
+    force: bool,
+    model_override: Option<String>,
+}
+
 fn import_and_update_manifest(
     kind: AgentKind,
     trace: &ir::Trace,
     seed: &Path,
-    opencode_db: &Path,
-    pi_root: &Path,
-    force: bool,
+    opts: ImportOptions,
 ) -> Result<import::ImportResult, String> {
     let mut manifest = export::load_manifest(seed)?;
     let existing = manifest
         .target
         .as_ref()
         .filter(|target| target.agent == kind.as_str());
+    let model_override = opts.model_override.as_deref();
     let result = match kind {
         AgentKind::OpenCode => import::opencode::import_existing(
             trace,
-            opencode_db,
+            &opts.opencode_db,
             existing.map(|target| target.session_id.as_str()),
             existing.map(|target| target.anchor_message_id.as_str()),
-            force,
+            opts.force,
+            model_override,
         )?,
         AgentKind::Pi => import::pi::import_existing(
             trace,
-            pi_root,
+            &opts.pi_root,
             existing.map(|target| Path::new(&target.file)),
             existing.map(|target| target.session_id.as_str()),
             existing.map(|target| target.anchor_message_id.as_str()),
-            force,
+            opts.force,
+            model_override,
         )?,
-        AgentKind::Codex => return Err("codex import is not implemented yet".into()),
+        AgentKind::Codex => import::codex::import_existing(
+            trace,
+            &opts.codex_root,
+            existing.map(|target| Path::new(&target.file)),
+            existing.map(|target| target.session_id.as_str()),
+            existing.map(|target| target.anchor_message_id.as_str()),
+            opts.force,
+            model_override,
+        )?,
     };
     manifest.target = Some(export::TargetRef {
         agent: kind.as_str().into(),
@@ -336,6 +368,31 @@ fn import_and_update_manifest(
     });
     export::save_manifest(seed, &manifest)?;
     Ok(result)
+}
+
+fn warn_model_override(trace: &ir::Trace, model_override: Option<&str>) {
+    let original = trace
+        .meta
+        .model
+        .as_deref()
+        .and_then(|m| {
+            serde_json::from_str::<serde_json::Value>(m)
+                .ok()
+                .and_then(|v| v.get("id").and_then(|id| id.as_str()).map(String::from))
+        })
+        .or_else(|| trace.meta.model.clone())
+        .unwrap_or_else(|| "<none>".to_string());
+    if let Some(model) = model_override {
+        if original != model {
+            println!(
+                "note: overriding session model {original} -> {model} (the target may not support the source model)"
+            );
+        }
+    } else {
+        println!(
+            "note: source session model is {original}; if the target does not support it, pass --model <target-model>"
+        );
+    }
 }
 
 fn print_import_result(kind: AgentKind, seed: &Path, result: &import::ImportResult) {

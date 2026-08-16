@@ -7,5 +7,6 @@ pub struct ImportResult {
     pub dropped_event_count: usize,
 }
 
+pub mod codex;
 pub mod opencode;
 pub mod pi;

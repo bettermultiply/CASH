@@ -59,14 +59,33 @@ pub struct TraceMeta {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Trace {
     pub meta: TraceMeta,
+    /// The single representation of the session. `events` are extracted from
+    /// the native session losslessly (session -> events); materializing events
+    /// back into a native session is best-effort and may normalize.
     pub events: Vec<Event>,
 }
 
 /// One entry in the unified, portable execution trace.
+///
+/// Several events may share the same `original_id`: that marks them as derived
+/// from the same native record (e.g. one Pi message containing thinking, text
+/// and a tool call). `native` holds native-only metadata (usage, responseId,
+/// model, ...) so that extracting events from a session loses no information;
+/// fields other agents lack are simply absent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
+    /// Native record id this event derives from. Shared by all events that
+    /// come from the same native record.
+    pub original_id: String,
+    /// Native parent record id, when the source exposes one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_original_id: Option<String>,
     /// Epoch millis when the event happened, when the source exposes it.
     pub time: Option<i64>,
+    /// Native-only metadata (usage, responseId, model, errorMessage, ...),
+    /// kept so session -> events is lossless.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native: Option<serde_json::Value>,
     #[serde(flatten)]
     pub kind: EventKind,
 }
@@ -99,5 +118,11 @@ pub enum EventKind {
     ModelChange {
         provider: Option<String>,
         model: Option<String>,
+    },
+    /// A native record with no cross-agent semantic meaning (labels, compaction,
+    /// thinking level changes, unknown content blocks, ...). The full record is
+    /// kept verbatim in `Event::native` so session -> events loses nothing.
+    NativeRecord {
+        record_type: String,
     },
 }
