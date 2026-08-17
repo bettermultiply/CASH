@@ -237,6 +237,32 @@ pub fn read(path: &Path) -> Result<Trace, String> {
         }
     }
 
+    // Pi numbers tool calls sequentially (`toolCallId` on the result message),
+    // but the assistant's toolCall content block carries an unrelated internal
+    // id. Pair them in transcript order so a call and its result share one id;
+    // downstream targets (Codex in particular) pair by that id.
+    let calls: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| matches!(e.kind, EventKind::ToolCall { .. }))
+        .map(|(i, _)| i)
+        .collect();
+    let results: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| matches!(e.kind, EventKind::ToolResult { .. }))
+        .map(|(i, _)| i)
+        .collect();
+    for (call_idx, res_idx) in calls.iter().zip(&results) {
+        let call_id = match &events[*res_idx].kind {
+            EventKind::ToolResult { call_id, .. } => call_id.clone(),
+            _ => unreachable!(),
+        };
+        if let EventKind::ToolCall { id, .. } = &mut events[*call_idx].kind {
+            *id = call_id;
+        }
+    }
+
     if meta.session_id.is_empty() {
         meta.session_id = path
             .file_stem()

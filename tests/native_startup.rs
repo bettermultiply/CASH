@@ -3,6 +3,13 @@ use std::process::Command;
 
 use cash::{config, import, readers};
 
+/// Native-startup verification, one test per agent: import the same sanitized
+/// rich session into a temp native store, then launch the real agent CLI
+/// against that store and confirm the imported session is usable. This proves
+/// the binaries accept what CASH writes, which CASH cannot verify on its own.
+/// All tests write only to temp directories / copied stores and are skipped
+/// when the CLI is not installed.
+
 #[test]
 #[ignore = "requires opencode CLI; starts native CLI against a temp XDG data dir"]
 fn opencode_cli_can_list_and_export_imported_session() {
@@ -62,8 +69,8 @@ fn opencode_cli_can_list_and_export_imported_session() {
 }
 
 #[test]
-#[ignore = "requires pi CLI; starts native CLI export against a temp session root"]
-fn pi_cli_can_export_imported_session() {
+#[ignore = "requires pi CLI; starts native CLI export and TUI against a temp session root"]
+fn pi_cli_can_export_and_start_imported_session() {
     let pi_bin = std::env::var("CASH_PI_BIN")
         .unwrap_or_else(|_| "/home/betmul/.local/bin/pi".into());
     if !Path::new(&pi_bin).exists() {
@@ -71,15 +78,15 @@ fn pi_cli_can_export_imported_session() {
         return;
     }
 
-    let tmp =
-        std::env::temp_dir().join(format!("cash-native-pi-{}", uuid::Uuid::new_v4().simple()));
+    let tmp = std::env::temp_dir().join(format!("cash-native-pi-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&tmp).unwrap();
 
     let trace = readers::pi::read(&fixture("real/pi_real_sanitized.jsonl")).unwrap();
     let result =
         import::pi::import(&trace, &tmp.join("pi-root")).expect("import into temp pi root");
-    let html = tmp.join("session.html");
 
+    // Real pi CLI must accept the imported session for offline export.
+    let html = tmp.join("session.html");
     let output = Command::new(&pi_bin)
         .args([
             "--offline",
@@ -96,28 +103,8 @@ fn pi_cli_can_export_imported_session() {
     );
     assert!(html.metadata().map(|m| m.len()).unwrap_or(0) > 0);
 
-    let _ = std::fs::remove_dir_all(&tmp);
-}
-
-#[test]
-#[ignore = "requires pi CLI and a PTY; starts the imported session without making a model request"]
-fn pi_tui_starts_imported_session_without_uncaught_exception() {
-    let pi_bin = std::env::var("CASH_PI_BIN")
-        .unwrap_or_else(|_| "/home/betmul/.local/bin/pi".into());
-    if !Path::new(&pi_bin).exists() {
-        eprintln!("pi CLI not found at {pi_bin}; skipping native startup test");
-        return;
-    }
-
-    let tmp = std::env::temp_dir().join(format!(
-        "cash-native-pi-tui-{}",
-        uuid::Uuid::new_v4().simple()
-    ));
-    std::fs::create_dir_all(&tmp).unwrap();
-    let trace = readers::pi::read(&fixture("real/pi_real_sanitized.jsonl")).unwrap();
-    let result =
-        import::pi::import(&trace, &tmp.join("pi-root")).expect("import into temp pi root");
-
+    // Real pi TUI must load the session without an uncaught exception: it must
+    // still be running when the startup timeout fires (exit code 124).
     let command = format!(
         "timeout --signal=INT --kill-after=2s 4s {} --offline --no-extensions --no-skills --no-themes --no-context-files --session {}",
         shell_quote(&pi_bin),
@@ -142,19 +129,28 @@ fn pi_tui_starts_imported_session_without_uncaught_exception() {
 }
 
 #[test]
-#[ignore = "requires codex CLI, a copied CODEX_HOME, and one real model call"]
+#[ignore = "requires codex CLI and one real model call"]
 fn codex_cli_resumes_imported_session() {
     if Command::new("codex").arg("--version").output().is_err() {
         eprintln!("codex not found; skipping native startup test");
         return;
     }
-    let tmp = std::env::temp_dir().join(format!(
-        "cash-native-codex-{}",
-        uuid::Uuid::new_v4().simple()
-    ));
+    // codex refuses to create helper binaries when CODEX_HOME lives under a
+    // temporary dir such as /tmp, so use a git-ignored dir in the workspace.
+    let tmp = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target/cash-native-codex")
+        .join(uuid::Uuid::new_v4().simple().to_string());
     std::fs::create_dir_all(&tmp).unwrap();
     let codex_home = tmp.join(".codex");
-    copy_dir(&config::home_dir().join(".codex"), &codex_home);
+    std::fs::create_dir_all(&codex_home).unwrap();
+    // Only the config and credentials are needed: the ~800MB of logs and
+    // existing rollouts are irrelevant to resuming an imported session.
+    for name in ["config.toml", "auth.json"] {
+        let src = config::home_dir().join(".codex").join(name);
+        if src.exists() {
+            let _ = std::fs::copy(&src, codex_home.join(name));
+        }
+    }
 
     let trace = readers::pi::read(&fixture("real/pi_real_sanitized.jsonl")).unwrap();
     let result = import::codex::import(&trace, &codex_home.join("sessions")).expect("import codex");
@@ -187,22 +183,6 @@ fn codex_cli_resumes_imported_session() {
     );
 
     let _ = std::fs::remove_dir_all(&tmp);
-}
-
-fn copy_dir(from: &Path, to: &Path) {
-    if !from.exists() {
-        return;
-    }
-    std::fs::create_dir_all(to).unwrap();
-    for entry in std::fs::read_dir(from).unwrap().flatten() {
-        let src = entry.path();
-        let dst = to.join(entry.file_name());
-        if src.is_dir() {
-            copy_dir(&src, &dst);
-        } else {
-            let _ = std::fs::copy(&src, &dst);
-        }
-    }
 }
 
 /// Copy an OpenCode store consistently (live WAL may not be in the main .db).

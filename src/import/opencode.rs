@@ -140,7 +140,7 @@ pub fn import_existing(
     // Events are the single representation. Consecutive events sharing an
     // original_id (a message) are grouped into one message row with its parts.
     let mut i = 0usize;
-    let mut pending_tool: Option<(String, String, String)> = None;
+    let mut pending_tool: Vec<(String, String, String)> = Vec::new();
     let mut previous_message_id: Option<String> = None;
     while i < trace.events.len() {
         let oid = trace.events[i].original_id.clone();
@@ -278,7 +278,7 @@ pub fn append_existing(
         )
         .map_err(|e| format!("update event sequence: {e}"))?;
     }
-    let mut pending_tool: Option<(String, String, String)> = None;
+    let mut pending_tool: Vec<(String, String, String)> = Vec::new();
     let mut previous_message_id: Option<String> = tx
         .query_row(
             "SELECT id FROM message WHERE session_id = ?1 ORDER BY time_created DESC, id DESC LIMIT 1",
@@ -385,7 +385,7 @@ fn emit_group(
     cwd: &str,
     event_time: i64,
     event_seq: &mut i64,
-    pending_tool: &mut Option<(String, String, String)>,
+    pending_tool: &mut Vec<(String, String, String)>,
     v2: bool,
 ) -> Result<(), String> {
     let start_time = group
@@ -426,8 +426,7 @@ fn emit_group(
     )
     .map_err(|e| format!("insert message: {e}"))?;
 
-    let mut tool_call: Option<(String, String, String)> = None;
-    let mut tool_result: Option<(String, String, Option<i32>, Option<String>, i64)> = None;
+    let mut calls: Vec<(String, String, String)> = Vec::new();
     let mut content: Vec<Value> = Vec::new();
     let mut text_n = 0usize;
     let mut reasoning_n = 0usize;
@@ -572,7 +571,7 @@ fn emit_group(
                 arguments,
                 ..
             } => {
-                tool_call = Some((id.clone(), name.clone(), arguments.clone()));
+                calls.push((id.clone(), name.clone(), arguments.clone()));
             }
             EventKind::ToolResult {
                 call_id,
@@ -580,169 +579,178 @@ fn emit_group(
                 exit_code,
                 error,
             } => {
-                tool_result =
-                    Some((call_id.clone(), output.clone(), *exit_code, error.clone(), ev.time.unwrap_or(event_time)));
+                // Pair the result with its call: prefer a call in this group
+                // sharing the id, then the group's last unmatched call, then a
+                // call buffered from a previous native record (e.g. Pi stores
+                // call and result in separate records). One tool part is
+                // written per call/result pair, so a single message with
+                // multiple tools round-trips losslessly.
+                let call = calls
+                    .iter()
+                    .rposition(|(cid, _, _)| cid == call_id)
+                    .map(|i| calls.remove(i))
+                    .or_else(|| {
+                        if calls.is_empty() {
+                            pending_tool.pop()
+                        } else {
+                            Some(calls.remove(calls.len() - 1))
+                        }
+                    });
+                let (name, args) = match call {
+                    Some((_, name, args)) => (name, args),
+                    None => ("tool".to_string(), "{}".to_string()),
+                };
+                let args_val: Value = serde_json::from_str(&args)
+                    .ok()
+                    .filter(|v: &Value| v.is_object())
+                    .unwrap_or_else(|| json!({}));
+                let error_text = error.clone().unwrap_or_default();
+                let result_time = ev.time.unwrap_or(event_time);
+
+                // ---- legacy tool part (strict v1 ToolState schema) ----
+                let state = if error.is_some() {
+                    json!({
+                        "status": "error",
+                        "input": args_val,
+                        "error": error_text,
+                        "metadata": {},
+                        "time": {"start": event_time, "end": event_time},
+                    })
+                } else {
+                    json!({
+                        "status": "completed",
+                        "input": args_val,
+                        "output": output,
+                        "title": "",
+                        "metadata": {"exit": exit_code},
+                        "time": {"start": event_time, "end": event_time},
+                    })
+                };
+                insert_part(
+                    tx,
+                    session_id,
+                    msg_id,
+                    json!({
+                        "type": "tool",
+                        "callID": call_id,
+                        "tool": name,
+                        "state": state,
+                    }),
+                    event_time,
+                )?;
+
+                // ---- v2 durable tool events + projected content ----
+                if v2 {
+                    insert_event(
+                        tx,
+                        session_id,
+                        event_seq,
+                        "session.next.tool.input.started.1",
+                        &json!({
+                            "sessionID": session_id,
+                            "timestamp": result_time,
+                            "assistantMessageID": msg_id,
+                            "callID": call_id,
+                            "name": name,
+                        }),
+                    )?;
+                    insert_event(
+                        tx,
+                        session_id,
+                        event_seq,
+                        "session.next.tool.input.ended.1",
+                        &json!({
+                            "sessionID": session_id,
+                            "timestamp": result_time,
+                            "assistantMessageID": msg_id,
+                            "callID": call_id,
+                            "text": args,
+                        }),
+                    )?;
+                    insert_event(
+                        tx,
+                        session_id,
+                        event_seq,
+                        "session.next.tool.called.1",
+                        &json!({
+                            "sessionID": session_id,
+                            "timestamp": result_time,
+                            "assistantMessageID": msg_id,
+                            "callID": call_id,
+                            "tool": name,
+                            "input": args_val,
+                            "provider": {"executed": false},
+                        }),
+                    )?;
+                    if let Some(err) = error {
+                        insert_event(
+                            tx,
+                            session_id,
+                            event_seq,
+                            "session.next.tool.failed.1",
+                            &json!({
+                                "sessionID": session_id,
+                                "timestamp": result_time,
+                                "assistantMessageID": msg_id,
+                                "callID": call_id,
+                                "error": {"type": "unknown", "message": err},
+                                "provider": {"executed": false},
+                            }),
+                        )?;
+                        content.push(json!({
+                            "type": "tool",
+                            "id": call_id,
+                            "name": name,
+                            "state": {
+                                "status": "error",
+                                "input": args_val,
+                                "content": [],
+                                "structured": {},
+                                "error": {"type": "unknown", "message": err},
+                            },
+                            "time": {"created": result_time, "ran": result_time, "completed": result_time},
+                        }));
+                    } else {
+                        insert_event(
+                            tx,
+                            session_id,
+                            event_seq,
+                            "session.next.tool.success.1",
+                            &json!({
+                                "sessionID": session_id,
+                                "timestamp": result_time,
+                                "assistantMessageID": msg_id,
+                                "callID": call_id,
+                                "structured": {},
+                                "content": [],
+                                "result": output,
+                                "provider": {"executed": false},
+                            }),
+                        )?;
+                        content.push(json!({
+                            "type": "tool",
+                            "id": call_id,
+                            "name": name,
+                            "state": {
+                                "status": "completed",
+                                "input": args_val,
+                                "content": [],
+                                "structured": {},
+                                "result": output,
+                            },
+                            "time": {"created": result_time, "ran": result_time, "completed": result_time},
+                        }));
+                    }
+                }
             }
             EventKind::ModelChange { .. } => {}
             EventKind::NativeRecord { .. } => {}
         }
     }
 
-    // OpenCode stores call+result in a single tool part. A call and its
-    // result may come from different native records (e.g. Pi), so buffer
-    // the call across groups.
-    if tool_call.is_some() {
-        *pending_tool = tool_call.clone();
-    }
-    if let Some((call_id, output, exit, error, result_time)) = tool_result {
-        let (name, args) = match (tool_call, &*pending_tool) {
-            (Some((_, name, args)), _) => (name, args.clone()),
-            (None, Some((_, name, args))) => (name.clone(), args.clone()),
-            _ => ("tool".to_string(), "{}".to_string()),
-        };
-        let args_val: Value = serde_json::from_str(&args)
-            .ok()
-            .filter(|v: &Value| v.is_object())
-            .unwrap_or_else(|| json!({}));
-        let error_text = error.clone().unwrap_or_default();
-
-        // ---- legacy tool part (strict v1 ToolState schema) ----
-        let state = if error.is_some() {
-            json!({
-                "status": "error",
-                "input": args_val,
-                "error": error_text,
-                "metadata": {},
-                "time": {"start": event_time, "end": event_time},
-            })
-        } else {
-            json!({
-                "status": "completed",
-                "input": args_val,
-                "output": output,
-                "title": "",
-                "metadata": {"exit": exit},
-                "time": {"start": event_time, "end": event_time},
-            })
-        };
-        insert_part(
-            tx,
-            session_id,
-            msg_id,
-            json!({
-                "type": "tool",
-                "callID": call_id,
-                "tool": name,
-                "state": state,
-            }),
-            event_time,
-        )?;
-
-        // ---- v2 durable tool events + projected content ----
-        if v2 {
-            insert_event(
-                tx,
-                session_id,
-                event_seq,
-                "session.next.tool.input.started.1",
-                &json!({
-                    "sessionID": session_id,
-                    "timestamp": result_time,
-                    "assistantMessageID": msg_id,
-                    "callID": call_id,
-                    "name": name,
-                }),
-            )?;
-            insert_event(
-                tx,
-                session_id,
-                event_seq,
-                "session.next.tool.input.ended.1",
-                &json!({
-                    "sessionID": session_id,
-                    "timestamp": result_time,
-                    "assistantMessageID": msg_id,
-                    "callID": call_id,
-                    "text": args,
-                }),
-            )?;
-            insert_event(
-                tx,
-                session_id,
-                event_seq,
-                "session.next.tool.called.1",
-                &json!({
-                    "sessionID": session_id,
-                    "timestamp": result_time,
-                    "assistantMessageID": msg_id,
-                    "callID": call_id,
-                    "tool": name,
-                    "input": args_val,
-                    "provider": {"executed": false},
-                }),
-            )?;
-            if let Some(err) = error {
-                insert_event(
-                    tx,
-                    session_id,
-                    event_seq,
-                    "session.next.tool.failed.1",
-                    &json!({
-                        "sessionID": session_id,
-                        "timestamp": result_time,
-                        "assistantMessageID": msg_id,
-                        "callID": call_id,
-                        "error": {"type": "unknown", "message": err},
-                        "provider": {"executed": false},
-                    }),
-                )?;
-                content.push(json!({
-                    "type": "tool",
-                    "id": call_id,
-                    "name": name,
-                    "state": {
-                        "status": "error",
-                        "input": args_val,
-                        "content": [],
-                        "structured": {},
-                        "error": {"type": "unknown", "message": err},
-                    },
-                    "time": {"created": result_time, "ran": result_time, "completed": result_time},
-                }));
-            } else {
-                insert_event(
-                    tx,
-                    session_id,
-                    event_seq,
-                    "session.next.tool.success.1",
-                    &json!({
-                        "sessionID": session_id,
-                        "timestamp": result_time,
-                        "assistantMessageID": msg_id,
-                        "callID": call_id,
-                        "structured": {},
-                        "content": [],
-                        "result": output,
-                        "provider": {"executed": false},
-                    }),
-                )?;
-                content.push(json!({
-                    "type": "tool",
-                    "id": call_id,
-                    "name": name,
-                    "state": {
-                        "status": "completed",
-                        "input": args_val,
-                        "content": [],
-                        "structured": {},
-                        "result": output,
-                    },
-                    "time": {"created": result_time, "ran": result_time, "completed": result_time},
-                }));
-            }
-        }
-        *pending_tool = None;
-    }
+    // Buffer any calls that had no result in this group so a later group can
+    // pair against them.
+    pending_tool.extend(calls);
 
     // ---- v2 durable events + session_message projection ----
     if v2 {

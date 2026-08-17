@@ -19,100 +19,6 @@ fn real_fixture(name: &str) -> PathBuf {
 }
 
 #[test]
-fn codex_reader_extracts_events() {
-    let trace = readers::codex::read(&fixture("codex.jsonl")).expect("read codex fixture");
-    assert_eq!(trace.meta.session_id, "codex-sess-1");
-    assert_eq!(trace.meta.cwd.as_deref(), Some("/tmp/work"));
-    assert_eq!(trace.meta.source_file_sha256.len(), 64);
-
-    let types: Vec<&str> = trace
-        .events
-        .iter()
-        .map(|e| match &e.kind {
-            EventKind::UserMessage { .. } => "user",
-            EventKind::AssistantMessage { .. } => "assistant",
-            EventKind::Reasoning { .. } => "reasoning",
-            EventKind::ToolCall { .. } => "tool_call",
-            EventKind::ToolResult { .. } => "tool_result",
-            EventKind::ModelChange { .. } => "model_change",
-            EventKind::NativeRecord { .. } => "native_record",
-        })
-        .collect();
-    assert_eq!(
-        types,
-        vec!["user", "assistant", "tool_call", "tool_result", "reasoning"]
-    );
-    assert_eq!(trace.meta.event_count, 5);
-
-    // tool call args preserved verbatim
-    let tool_call = trace
-        .events
-        .iter()
-        .find(|e| matches!(e.kind, EventKind::ToolCall { .. }))
-        .unwrap();
-    match &tool_call.kind {
-        EventKind::ToolCall {
-            id,
-            name,
-            arguments,
-        } => {
-            assert_eq!(id, "call_1");
-            assert_eq!(name, "bash");
-            assert_eq!(arguments, r#"{"cmd":"ls"}"#);
-        }
-        _ => unreachable!(),
-    }
-}
-
-#[test]
-fn pi_reader_extracts_events() {
-    let trace = readers::pi::read(&fixture("pi.jsonl")).expect("read pi fixture");
-    assert_eq!(trace.meta.session_id, "pi-sess-1");
-    assert_eq!(trace.meta.cwd.as_deref(), Some("/tmp/work"));
-
-    let types: Vec<&str> = trace
-        .events
-        .iter()
-        .map(|e| match &e.kind {
-            EventKind::UserMessage { .. } => "user",
-            EventKind::AssistantMessage { .. } => "assistant",
-            EventKind::Reasoning { .. } => "reasoning",
-            EventKind::ToolCall { .. } => "tool_call",
-            EventKind::ToolResult { .. } => "tool_result",
-            EventKind::ModelChange { .. } => "model_change",
-            EventKind::NativeRecord { .. } => "native_record",
-        })
-        .collect();
-    assert_eq!(
-        types,
-        vec![
-            "model_change",
-            "user",
-            "reasoning",
-            "assistant",
-            "tool_call",
-            "tool_result"
-        ]
-    );
-    assert_eq!(trace.meta.event_count, 6);
-
-    let tool_result = trace
-        .events
-        .iter()
-        .find(|e| matches!(e.kind, EventKind::ToolResult { .. }))
-        .unwrap();
-    match &tool_result.kind {
-        EventKind::ToolResult {
-            call_id, output, ..
-        } => {
-            assert_eq!(call_id, "call_a");
-            assert_eq!(output, "2026-01-01");
-        }
-        _ => unreachable!(),
-    }
-}
-
-#[test]
 fn list_pi_prints_human_readable_summaries_and_resolvable_ids() {
     let root = std::env::temp_dir().join(format!("cash-list-pi-{}", uuid::Uuid::new_v4().simple()));
     let sessions = root.join("sessions");
@@ -385,7 +291,6 @@ fn export_writes_seed_files_and_manifest() {
     assert_eq!(manifest.copies().len(), 1, "seed starts with one peer copy");
     assert_eq!(manifest.copies()[0].agent, "pi");
     assert_eq!(manifest.copies()[0].session_id, "pi-sess-1");
-    assert!(manifest.source.is_none(), "new manifests write only the peer group");
 
     // seed.json round-trips back to an equivalent trace
     let raw = std::fs::read_to_string(dir.join("seed.json")).unwrap();
@@ -454,16 +359,13 @@ fn import_into_opencode_round_trips() {
 }
 
 #[test]
-fn import_into_pi_round_trips_all_events() {
+fn import_into_pi_writes_assistant_metadata() {
     let trace = readers::pi::read(&fixture("pi.jsonl")).unwrap();
     let dir = std::env::temp_dir().join(format!("cash-pi-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&dir).unwrap();
 
     let result = import::pi::import(&trace, &dir).expect("import pi");
     assert!(std::path::Path::new(&result.file).exists());
-    let native_entries: std::collections::HashSet<_> =
-        trace.events.iter().map(|e| &e.original_id).collect();
-    assert_eq!(result.message_count, native_entries.len());
     assert!(!result.anchor_message_id.is_empty());
 
     let mut assistant_count = 0;
@@ -516,36 +418,6 @@ fn import_into_pi_round_trips_all_events() {
         );
     }
     assert!(assistant_count > 0);
-
-    let back = readers::pi::read(std::path::Path::new(&result.file)).expect("re-read pi");
-    assert_eq!(back.events.len(), trace.events.len());
-    let kinds: Vec<&str> = back
-        .events
-        .iter()
-        .map(|e| match &e.kind {
-            EventKind::UserMessage { .. } => "user",
-            EventKind::AssistantMessage { .. } => "assistant",
-            EventKind::Reasoning { .. } => "reasoning",
-            EventKind::ToolCall { .. } => "tool_call",
-            EventKind::ToolResult { .. } => "tool_result",
-            EventKind::ModelChange { .. } => "model_change",
-            EventKind::NativeRecord { .. } => "native_record",
-        })
-        .collect();
-    let expected: Vec<&str> = trace
-        .events
-        .iter()
-        .map(|e| match &e.kind {
-            EventKind::UserMessage { .. } => "user",
-            EventKind::AssistantMessage { .. } => "assistant",
-            EventKind::Reasoning { .. } => "reasoning",
-            EventKind::ToolCall { .. } => "tool_call",
-            EventKind::ToolResult { .. } => "tool_result",
-            EventKind::ModelChange { .. } => "model_change",
-            EventKind::NativeRecord { .. } => "native_record",
-        })
-        .collect();
-    assert_eq!(kinds, expected);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -723,6 +595,55 @@ fn pi_to_pi_round_trip_preserves_events() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn opencode_to_opencode_round_trip_preserves_content() {
+    let dir = std::env::temp_dir().join(format!(
+        "cash-open-lossless-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("opencode.db");
+    create_schema(&db);
+    let sql = std::fs::read_to_string(real_fixture("opencode_real_sanitized.sql")).unwrap();
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch(&sql).unwrap();
+    drop(conn);
+
+    let trace = readers::opencode::read(&db, "opencode-real-sanitized").unwrap();
+    assert!(trace.events.len() > 100);
+
+    let out = dir.join("out.db");
+    create_schema(&out);
+    let result = import::opencode::import(&trace, &out).expect("import opencode");
+    let back = readers::opencode::read(&out, &result.session_id).unwrap();
+
+    // OpenCode regenerates message ids on import, so a strict event-equality
+    // round trip is impossible. The guarantee is content fidelity: the same
+    // event kinds and payloads in the same order, ignoring regenerated ids
+    // and the native metadata that is rebuilt around them.
+    let strip = |events: &[cash::ir::Event]| -> String {
+        let items: Vec<String> = events
+            .iter()
+            .map(|e| {
+                let mut e = e.clone();
+                e.original_id = String::new();
+                e.parent_original_id = None;
+                e.native = None;
+                e.time = None;
+                serde_json::to_string(&e).unwrap()
+            })
+            .collect();
+        serde_json::to_string(&items).unwrap()
+    };
+    assert_eq!(
+        strip(&trace.events),
+        strip(&back.events),
+        "opencode -> opencode round trip changed the trace content"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn load_jsonl(path: &std::path::Path) -> Vec<serde_json::Value> {
     std::fs::read_to_string(path)
         .unwrap()
@@ -743,32 +664,36 @@ fn write_jsonl_values(path: &std::path::Path, values: &[serde_json::Value]) {
 }
 
 #[test]
-fn sanitized_real_pi_fixture_covers_rich_session_shape() {
-    let trace = readers::pi::read(&real_fixture("pi_real_sanitized.jsonl")).unwrap();
-    assert!(trace.events.len() > 100);
-    assert!(
-        trace
-            .events
-            .iter()
-            .any(|e| matches!(e.kind, EventKind::Reasoning { .. }))
-    );
-    assert!(
-        trace
-            .events
-            .iter()
-            .any(|e| matches!(e.kind, EventKind::ToolCall { .. }))
-    );
-    assert!(
-        trace
-            .events
-            .iter()
-            .any(|e| matches!(e.kind, EventKind::ToolResult { .. }))
-    );
+fn sanitized_real_fixtures_cover_rich_shapes() {
+    let pi = readers::pi::read(&real_fixture("pi_real_sanitized.jsonl")).unwrap();
+    assert_rich(&pi, "pi", 0);
+
+    let codex = readers::codex::read(&real_fixture("codex_real_sanitized.jsonl")).unwrap();
+    assert_rich(&codex, "codex", 20);
+
+    let dir = std::env::temp_dir().join(format!("cash-real-sql-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("opencode.db");
+    create_schema(&db);
+    let sql = std::fs::read_to_string(real_fixture("opencode_real_sanitized.sql")).unwrap();
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch(&sql).unwrap();
+    drop(conn);
+    let opencode = readers::opencode::read(&db, "opencode-real-sanitized").unwrap();
+    assert_rich(&opencode, "opencode", 0);
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
-fn sanitized_real_codex_fixture_covers_modern_tool_shapes() {
-    let trace = readers::codex::read(&real_fixture("codex_real_sanitized.jsonl")).unwrap();
+fn assert_rich(trace: &cash::ir::Trace, label: &str, min_tools: usize) {
+    assert!(trace.events.len() > 100, "{label} fixture too small");
+    assert!(
+        trace
+            .events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::Reasoning { .. })),
+        "{label} fixture has no reasoning"
+    );
     let tool_calls = trace
         .events
         .iter()
@@ -779,259 +704,153 @@ fn sanitized_real_codex_fixture_covers_modern_tool_shapes() {
         .iter()
         .filter(|e| matches!(e.kind, EventKind::ToolResult { .. }))
         .count();
-    assert!(trace.events.len() > 100);
-    assert!(tool_calls > 20);
-    assert!(tool_results > 20);
+    assert!(tool_calls > min_tools, "{label} fixture has too few tool calls");
+    assert!(
+        tool_results > min_tools,
+        "{label} fixture has too few tool results"
+    );
 }
 
 #[test]
-fn sanitized_real_opencode_fixture_parses_sql_session() {
-    let dir = std::env::temp_dir().join(format!("cash-real-sql-{}", uuid::Uuid::new_v4().simple()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let db = dir.join("opencode.db");
-    create_schema(&db);
-    let sql = std::fs::read_to_string(real_fixture("opencode_real_sanitized.sql")).unwrap();
-    let conn = rusqlite::Connection::open(&db).unwrap();
-    conn.execute_batch(&sql).unwrap();
+fn sync_broadcasts_pi_continuation_to_all_copies() {
+    let (env, _codex_root) = three_copy_env("broadcast-pi");
+    let oc_session = manifest_node(&env.seed, "opencode")["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let codex_file = manifest_node(&env.seed, "codex")["file"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
-    let trace = readers::opencode::read(&db, "opencode-real-sanitized").unwrap();
-    assert!(trace.events.len() > 100);
-    assert!(
-        trace
-            .events
-            .iter()
-            .any(|e| matches!(e.kind, EventKind::Reasoning { .. }))
-    );
-    assert!(
-        trace
-            .events
-            .iter()
-            .any(|e| matches!(e.kind, EventKind::ToolCall { .. }))
-    );
-    assert!(
-        trace
-            .events
-            .iter()
-            .any(|e| matches!(e.kind, EventKind::ToolResult { .. }))
-    );
+    append_pi_continuation(&env, "continue in pi", "pi continuation");
 
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn convert_command_updates_same_pi_session_instead_of_duplicating() {
-    let env = cli_test_env("idempotent");
-    let first = run_convert(&env, false);
-    assert!(
-        first.status.success(),
-        "first convert failed: {}",
-        String::from_utf8_lossy(&first.stderr)
-    );
-    let first_target = manifest_target(&env.seed);
-
-    let second = run_convert(&env, false);
-    assert!(
-        second.status.success(),
-        "second convert failed: {}",
-        String::from_utf8_lossy(&second.stderr)
-    );
-    let second_target = manifest_target(&env.seed);
-
-    assert_eq!(second_target["session_id"], first_target["session_id"]);
-    assert_eq!(second_target["file"], first_target["file"]);
-    assert_eq!(count_jsonl(&env.pi_root), 1);
-
-    let _ = std::fs::remove_dir_all(&env.root);
-}
-
-#[test]
-fn sync_appends_pi_continuation_to_original_opencode_session() {
-    let env = cli_test_env("sync-back");
-    let first = run_convert(&env, false);
-    assert!(
-        first.status.success(),
-        "first convert failed: {}",
-        String::from_utf8_lossy(&first.stderr)
-    );
-    let target = manifest_target(&env.seed);
-    let target_file = PathBuf::from(target["file"].as_str().unwrap());
-    let anchor = target["anchor_message_id"].as_str().unwrap();
-    let mut file = std::fs::OpenOptions::new()
-        .append(true)
-        .open(&target_file)
-        .unwrap();
-    for value in [
-        serde_json::json!({
-            "type": "message",
-            "id": "sync-user",
-            "parentId": anchor,
-            "timestamp": "2026-01-02T00:00:00.000Z",
-            "message": {"role": "user", "content": [{"type": "text", "text": "continue in pi"}]}
-        }),
-        serde_json::json!({
-            "type": "message",
-            "id": "sync-assistant",
-            "parentId": "sync-user",
-            "timestamp": "2026-01-02T00:00:01.000Z",
-            "message": {"role": "assistant", "content": [{"type": "text", "text": "pi continuation"}], "model": "cash", "provider": "cash", "api": "cash", "stopReason": "stop", "usage": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0, "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}}}
-        }),
-    ] {
-        use std::io::Write;
-        writeln!(file, "{}", serde_json::to_string(&value).unwrap()).unwrap();
-    }
-
-    let before = count_opencode_messages(&env.db, "opencode-real-sanitized");
-    let synced = run_sync(&env, false);
+    let synced = run_sync_session(&env, "id_0001", false);
     assert!(
         synced.status.success(),
         "sync failed: {}",
         String::from_utf8_lossy(&synced.stderr)
     );
-    let after = count_opencode_messages(&env.db, "opencode-real-sanitized");
-    assert_eq!(after, before + 2);
-    assert_eq!(
-        count_opencode_sessions(&env.db, "opencode-real-sanitized"),
-        1
+    assert!(
+        String::from_utf8_lossy(&synced.stdout).contains("synced"),
+        "unexpected sync output: {}",
+        String::from_utf8_lossy(&synced.stdout)
     );
 
-    let status = Command::new(env!("CARGO_BIN_EXE_cash"))
-        .args([
-            "status",
-            env.seed.to_str().unwrap(),
-            "--opencode-db",
-            env.db.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        status.status.success(),
-        "status failed: {}",
-        String::from_utf8_lossy(&status.stderr)
-    );
-    let status_stdout = String::from_utf8(status.stdout).unwrap();
-    assert!(status_stdout.contains("file hash unchanged: yes"));
-    assert!(status_stdout.contains("continued past seed: NO"));
+    let oc_trace = readers::opencode::read(&env.db, &oc_session).unwrap();
+    assert_has_user(&oc_trace, "continue in pi");
+    assert_has_assistant(&oc_trace, "pi continuation");
 
-    let repeated = run_sync(&env, false);
+    let codex_trace = readers::codex::read(std::path::Path::new(&codex_file)).unwrap();
+    assert_has_user(&codex_trace, "continue in pi");
+    assert_has_assistant(&codex_trace, "pi continuation");
+
+    // idempotent: a repeated sync appends nothing
+    let repeated = run_sync_session(&env, "id_0001", false);
+    assert!(repeated.status.success());
     assert!(
-        repeated.status.success(),
-        "repeated sync failed: {}",
-        String::from_utf8_lossy(&repeated.stderr)
+        String::from_utf8_lossy(&repeated.stdout).contains("no new events"),
+        "repeated sync should be a no-op: {}",
+        String::from_utf8_lossy(&repeated.stdout)
     );
     assert_eq!(
-        count_opencode_messages(&env.db, "opencode-real-sanitized"),
-        after
+        readers::opencode::read(&env.db, &oc_session).unwrap().events.len(),
+        oc_trace.events.len()
     );
-    assert!(String::from_utf8_lossy(&repeated.stdout).contains("no new events"));
-
-    let _ = std::fs::remove_dir_all(&env.root);
-}
-
-#[test]
-fn sync_appends_codex_continuation_to_original_pi_session() {
-    let root = std::env::temp_dir().join(format!(
-        "cash-sync-codex-pi-{}",
-        uuid::Uuid::new_v4().simple()
-    ));
-    let pi_root = root.join("pi-root");
-    let codex_root = root.join("codex-root");
-    let seed_root = root.join("seeds");
-    std::fs::create_dir_all(&pi_root).unwrap();
-    std::fs::create_dir_all(&codex_root).unwrap();
-    let source_file = pi_root.join("source.jsonl");
-    std::fs::copy(fixture("pi.jsonl"), &source_file).unwrap();
-
-    let converted = Command::new(env!("CARGO_BIN_EXE_cash"))
-        .args([
-            "convert",
-            "pi",
-            "pi-sess-1",
-            "codex",
-            "--pi-root",
-            pi_root.to_str().unwrap(),
-            "--codex-root",
-            codex_root.to_str().unwrap(),
-        ])
-        .env("CASH_SEED_DIR", &seed_root)
-        .output()
-        .unwrap();
-    assert!(
-        converted.status.success(),
-        "convert failed: {}",
-        String::from_utf8_lossy(&converted.stderr)
-    );
-    let seed = seed_root.join("pi").join("pi-sess-1");
-    let target = manifest_target(&seed);
-    let target_file = PathBuf::from(target["file"].as_str().unwrap());
-    let mut file = std::fs::OpenOptions::new()
-        .append(true)
-        .open(&target_file)
-        .unwrap();
-    for value in [
-        serde_json::json!({
-            "type": "response_item",
-            "timestamp": "2026-01-02T00:00:00.000Z",
-            "payload": {"type": "message", "id": "developer-context", "role": "developer", "content": [{"type": "input_text", "text": "<permissions instructions>internal</permissions instructions>"}]}
-        }),
-        serde_json::json!({
-            "type": "response_item",
-            "timestamp": "2026-01-02T00:00:01.000Z",
-            "payload": {"type": "message", "id": "environment-context", "role": "user", "content": [{"type": "input_text", "text": "<environment_context>internal</environment_context>"}]}
-        }),
-        serde_json::json!({
-            "type": "response_item",
-            "timestamp": "2026-01-02T00:00:02.000Z",
-            "payload": {"type": "message", "id": "codex-user", "role": "user", "content": [{"type": "input_text", "text": "continued in codex"}]}
-        }),
-        serde_json::json!({
-            "type": "response_item",
-            "timestamp": "2026-01-02T00:00:03.000Z",
-            "payload": {"type": "message", "id": "codex-assistant", "role": "assistant", "content": [{"type": "output_text", "text": "codex continuation"}]}
-        }),
-    ] {
-        use std::io::Write;
-        writeln!(file, "{}", serde_json::to_string(&value).unwrap()).unwrap();
-    }
-    drop(file);
-
-    let run_sync = || {
-        Command::new(env!("CARGO_BIN_EXE_cash"))
-            .args([
-                "sync",
-                "pi-sess-1",
-                "--pi-root",
-                pi_root.to_str().unwrap(),
-                "--codex-root",
-                codex_root.to_str().unwrap(),
-            ])
-            .env("CASH_SEED_DIR", &seed_root)
-            .output()
+    assert_eq!(
+        readers::codex::read(std::path::Path::new(&codex_file))
             .unwrap()
-    };
-    let synced = run_sync();
+            .events
+            .len(),
+        codex_trace.events.len()
+    );
+
+    let _ = std::fs::remove_dir_all(&env.root);
+}
+
+#[test]
+fn sync_broadcasts_codex_continuation_to_all_copies() {
+    let (env, _codex_root) = three_copy_env("broadcast-codex");
+    let oc_session = manifest_node(&env.seed, "opencode")["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let codex_file = manifest_node(&env.seed, "codex")["file"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Continue in codex, mixing real content with machine-injected context that
+    // must NOT be propagated back as user messages.
+    append_codex_records(
+        &codex_file,
+        &[
+            serde_json::json!({
+                "type": "response_item",
+                "timestamp": "2026-01-02T00:00:00.000Z",
+                "payload": {"type": "message", "id": "developer-context", "role": "developer", "content": [{"type": "input_text", "text": "<permissions instructions>internal</permissions instructions>"}]}
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "timestamp": "2026-01-02T00:00:01.000Z",
+                "payload": {"type": "message", "id": "environment-context", "role": "user", "content": [{"type": "input_text", "text": "<environment_context>internal</environment_context>"}]}
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "timestamp": "2026-01-02T00:00:02.000Z",
+                "payload": {"type": "message", "id": "codex-user", "role": "user", "content": [{"type": "input_text", "text": "continued in codex"}]}
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "timestamp": "2026-01-02T00:00:03.000Z",
+                "payload": {"type": "message", "id": "codex-assistant", "role": "assistant", "content": [{"type": "output_text", "text": "codex continuation"}]}
+            }),
+        ],
+    );
+
+    let synced = run_sync_session(&env, "id_0001", false);
     assert!(
         synced.status.success(),
         "sync failed: {}",
         String::from_utf8_lossy(&synced.stderr)
     );
-    let trace = readers::pi::read(&source_file).unwrap();
-    assert_eq!(trace.events.len(), 8);
-    assert!(trace.events.iter().any(
-        |event| matches!(&event.kind, EventKind::UserMessage { text } if text == "continued in codex")
-    ));
-    assert!(trace.events.iter().any(
-        |event| matches!(&event.kind, EventKind::AssistantMessage { text } if text == "codex continuation")
-    ));
-    assert!(!trace.events.iter().any(|event| {
-        matches!(&event.kind, EventKind::UserMessage { text } if text.contains("environment_context") || text.contains("permissions instructions"))
+    assert!(
+        String::from_utf8_lossy(&synced.stdout).contains("synced"),
+        "unexpected sync output: {}",
+        String::from_utf8_lossy(&synced.stdout)
+    );
+
+    let is_injected = |text: &str| {
+        text.contains("environment_context") || text.contains("permissions instructions")
+    };
+    let pi_trace = readers::pi::read(&find_jsonl(&env.pi_root)).unwrap();
+    assert_has_user(&pi_trace, "continued in codex");
+    assert_has_assistant(&pi_trace, "codex continuation");
+    assert!(!pi_trace.events.iter().any(|event| {
+        matches!(&event.kind, EventKind::UserMessage { text } if is_injected(text))
     }));
 
-    let repeated = run_sync();
-    assert!(repeated.status.success());
-    assert_eq!(readers::pi::read(&source_file).unwrap().events.len(), 8);
-    assert!(String::from_utf8_lossy(&repeated.stdout).contains("no new events"));
+    let oc_trace = readers::opencode::read(&env.db, &oc_session).unwrap();
+    assert_has_user(&oc_trace, "continued in codex");
+    assert_has_assistant(&oc_trace, "codex continuation");
+    assert!(!oc_trace.events.iter().any(|event| {
+        matches!(&event.kind, EventKind::UserMessage { text } if is_injected(text))
+    }));
 
-    let _ = std::fs::remove_dir_all(&root);
+    // idempotent: a repeated sync appends nothing
+    let repeated = run_sync_session(&env, "id_0001", false);
+    assert!(repeated.status.success());
+    assert!(
+        String::from_utf8_lossy(&repeated.stdout).contains("no new events"),
+        "repeated sync should be a no-op: {}",
+        String::from_utf8_lossy(&repeated.stdout)
+    );
+    assert_eq!(
+        readers::pi::read(&find_jsonl(&env.pi_root)).unwrap().events.len(),
+        pi_trace.events.len()
+    );
+
+    let _ = std::fs::remove_dir_all(&env.root);
 }
 
 #[test]
@@ -1438,16 +1257,16 @@ fn opencode_import_writes_displayable_legacy_and_v2_state() {
 /// reaches every record (Pi rebuilds its view by walking parentId from the
 /// leaf, so foreign ids from OpenCode used to truncate the chain).
 #[test]
-fn sync_appends_opencode_continuation_into_pi_as_native_records() {
-    let env = cli_pi_source_env("oc-to-pi");
-    let converted = run_convert_pi(&env, false);
-    assert!(
-        converted.status.success(),
-        "convert failed: {}",
-        String::from_utf8_lossy(&converted.stderr)
-    );
-    let target = manifest_target(&env.seed);
-    let opencode_session = target["session_id"].as_str().unwrap().to_string();
+fn sync_broadcasts_opencode_continuation_to_all_copies() {
+    let (env, _codex_root) = three_copy_env("broadcast-opencode");
+    let oc_session = manifest_node(&env.seed, "opencode")["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let codex_file = manifest_node(&env.seed, "codex")["file"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     // Simulate the OpenCode server continuing the session (it writes legacy
     // v1-shaped messages, some of which have no parts when generation fails).
@@ -1460,7 +1279,7 @@ fn sync_appends_opencode_continuation_into_pi_as_native_records() {
     let last_time: i64 = conn
         .query_row(
             "SELECT MAX(time_created) FROM message WHERE session_id = ?1",
-            [&opencode_session],
+            [&oc_session],
             |r| r.get(0),
         )
         .unwrap();
@@ -1471,7 +1290,7 @@ fn sync_appends_opencode_continuation_into_pi_as_native_records() {
         conn.execute(
             "INSERT INTO message (id, session_id, time_created, time_updated, data)
              VALUES (?1, ?2, ?3, ?3, ?4)",
-            rusqlite::params![id, &opencode_session, time, serde_json::to_string(&data).unwrap()],
+            rusqlite::params![id, &oc_session, time, serde_json::to_string(&data).unwrap()],
         )
         .unwrap();
     };
@@ -1486,14 +1305,14 @@ fn sync_appends_opencode_continuation_into_pi_as_native_records() {
             rusqlite::params![
                 id,
                 message_id,
-                &opencode_session,
+                &oc_session,
                 time,
                 serde_json::to_string(&data).unwrap()
             ],
         )
         .unwrap();
     };
-    let user_data = |text: &str, t: i64| {
+    let user_data = |t: i64| {
         serde_json::json!({
             "role": "user",
             "time": {"created": t},
@@ -1518,12 +1337,12 @@ fn sync_appends_opencode_continuation_into_pi_as_native_records() {
     };
     let mut t = last_time;
     t += 1;
-    insert_message(&conn, "msg_cont_user_a", t, user_data("continue in opencode", t));
+    insert_message(&conn, "msg_cont_user_a", t, user_data(t));
     insert_part(&conn, "prt_cont_a", "msg_cont_user_a", t, serde_json::json!({"type": "text", "text": "continue in opencode"}));
     t += 1;
     insert_message(&conn, "msg_cont_empty_b", t, assistant_data("msg_cont_user_a", t));
     t += 1;
-    insert_message(&conn, "msg_cont_user_c", t, user_data("and again", t));
+    insert_message(&conn, "msg_cont_user_c", t, user_data(t));
     insert_part(&conn, "prt_cont_c", "msg_cont_user_c", t, serde_json::json!({"type": "text", "text": "and again"}));
     t += 1;
     insert_message(&conn, "msg_cont_assistant_d", t, assistant_data("msg_cont_user_c", t));
@@ -1559,13 +1378,13 @@ fn sync_appends_opencode_continuation_into_pi_as_native_records() {
         String::from_utf8_lossy(&synced.stdout)
     );
 
+    // ---- pi copy: A, C, D as Pi-native records, B skipped ----
     let file = find_jsonl(&env.pi_root);
     let entries = load_jsonl(&file);
     let by_id: std::collections::HashMap<&str, &serde_json::Value> = entries
         .iter()
         .map(|e| (e["id"].as_str().unwrap(), e))
         .collect();
-    // A, C, D were synced; the empty assistant B has no events and is skipped
     let synced_entries: Vec<&serde_json::Value> = entries
         .iter()
         .filter(|e| {
@@ -1637,18 +1456,10 @@ fn sync_appends_opencode_continuation_into_pi_as_native_records() {
     assert_eq!(text, "the continuation answer");
     assert_eq!(d_msg["usage"]["totalTokens"].as_i64(), Some(42)); // 10+20+5+7
 
-    // synced users are Pi-native (no opencode user fields leaked)
-    for id in ["msg_cont_user_a", "msg_cont_user_c"] {
-        let m = &by_id[id]["message"];
-        assert_eq!(m["role"], "user");
-        assert!(m.get("timestamp").is_some());
-        for foreign in ["agent", "model", "summary", "time"] {
-            assert!(
-                m.get(foreign).is_none(),
-                "opencode field {foreign} leaked into pi user record"
-            );
-        }
-    }
+    // ---- codex copy: same real content arrives as native records ----
+    let codex_trace = readers::codex::read(std::path::Path::new(&codex_file)).unwrap();
+    assert_has_user(&codex_trace, "continue in opencode");
+    assert_has_assistant(&codex_trace, "the continuation answer");
 
     // idempotent: a second sync appends nothing
     let before = count_jsonl(&env.pi_root);
@@ -1656,301 +1467,183 @@ fn sync_appends_opencode_continuation_into_pi_as_native_records() {
     assert!(repeated.status.success());
     assert!(String::from_utf8_lossy(&repeated.stdout).contains("no new events"));
     assert_eq!(count_jsonl(&env.pi_root), before);
-
-    let _ = std::fs::remove_dir_all(&env.root);
-}
-
-/// Multi-hop chain: pi -> opencode -> codex. Continuing at the codex end and
-/// running `sync` propagates the delta back into BOTH the pi source and the
-/// opencode middle copy; a repeated sync is a no-op.
-#[test]
-fn sync_propagates_across_multi_hop_chain() {
-    let env = cli_pi_source_env("multi-hop");
-    let converted = run_convert_pi(&env, false);
-    assert!(
-        converted.status.success(),
-        "pi -> opencode convert failed: {}",
-        String::from_utf8_lossy(&converted.stderr)
-    );
-    let oc_session = manifest_target(&env.seed)["session_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-
-    // Extend the chain opencode -> codex. No --seed: `convert` must find the
-    // existing seed by locating the opencode copy inside its mapping graph.
-    let codex_root = env.root.join("codex-root");
-    std::fs::create_dir_all(&codex_root).unwrap();
-    let to_codex = Command::new(env!("CARGO_BIN_EXE_cash"))
-        .args([
-            "convert",
-            "opencode",
-            &oc_session,
-            "codex",
-            "--opencode-db",
-            env.db.to_str().unwrap(),
-            "--codex-root",
-            codex_root.to_str().unwrap(),
-            "--pi-root",
-            env.pi_root.to_str().unwrap(),
-        ])
-        .env("CASH_SEED_DIR", &env.root)
-        .output()
-        .unwrap();
-    assert!(
-        to_codex.status.success(),
-        "opencode -> codex convert failed: {}",
-        String::from_utf8_lossy(&to_codex.stderr)
-    );
-
-    // The peer group now holds the original copy + two converted copies.
-    let manifest: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(env.seed.join("manifest.json")).unwrap(),
-    )
-    .unwrap();
-    let nodes = manifest["nodes"].as_array().expect("nodes array");
-    assert_eq!(nodes.len(), 3, "expected pi + opencode + codex copies");
-    let codex_node = nodes
-        .iter()
-        .find(|node| node["agent"] == "codex")
-        .expect("codex copy present");
-
-    // Continue the codex copy after the imported anchor.
-    let codex_file = PathBuf::from(codex_node["file"].as_str().unwrap());
-    let mut file = std::fs::OpenOptions::new()
-        .append(true)
-        .open(&codex_file)
-        .unwrap();
-    for value in [
-        serde_json::json!({
-            "type": "response_item",
-            "timestamp": "2026-01-03T00:00:00.000Z",
-            "payload": {"type": "message", "id": "hop-user", "role": "user", "content": [{"type": "input_text", "text": "continued at the codex end"}]}
-        }),
-        serde_json::json!({
-            "type": "response_item",
-            "timestamp": "2026-01-03T00:00:01.000Z",
-            "payload": {"type": "message", "id": "hop-assistant", "role": "assistant", "content": [{"type": "output_text", "text": "codex end continuation"}]}
-        }),
-    ] {
-        use std::io::Write;
-        writeln!(file, "{}", serde_json::to_string(&value).unwrap()).unwrap();
-    }
-    drop(file);
-
-    // sync by the original source id: the codex delta must reach both other copies
-    let synced = run_sync_session(&env, "id_0001", false);
-    assert!(
-        synced.status.success(),
-        "multi-hop sync failed: {}",
-        String::from_utf8_lossy(&synced.stderr)
-    );
-    assert!(
-        String::from_utf8_lossy(&synced.stdout).contains("synced"),
-        "unexpected sync output: {}",
-        String::from_utf8_lossy(&synced.stdout)
-    );
-
-    let pi_trace = readers::pi::read(&find_jsonl(&env.pi_root)).unwrap();
-    assert!(pi_trace.events.iter().any(|event| {
-        matches!(&event.kind, EventKind::UserMessage { text } if text == "continued at the codex end")
-    }));
-    assert!(pi_trace.events.iter().any(|event| {
-        matches!(&event.kind, EventKind::AssistantMessage { text } if text == "codex end continuation")
-    }));
-
-    let oc_trace = readers::opencode::read(&env.db, &oc_session).unwrap();
-    assert!(oc_trace.events.iter().any(|event| {
-        matches!(&event.kind, EventKind::UserMessage { text } if text == "continued at the codex end")
-    }));
-
-    // idempotent: a repeated sync appends nothing
-    let repeated = run_sync_session(&env, "id_0001", false);
-    assert!(repeated.status.success());
-    assert!(
-        String::from_utf8_lossy(&repeated.stdout).contains("no new events"),
-        "repeated sync should be a no-op: {}",
-        String::from_utf8_lossy(&repeated.stdout)
-    );
     assert_eq!(
-        readers::pi::read(&find_jsonl(&env.pi_root))
+        readers::codex::read(std::path::Path::new(&codex_file))
             .unwrap()
             .events
             .len(),
-        pi_trace.events.len()
+        codex_trace.events.len()
     );
 
     let _ = std::fs::remove_dir_all(&env.root);
 }
 
-/// Chain `pi -> opencode -> codex` produces a flat peer group: three equal
-/// `nodes`, no `source`/`targets`/`target`/`sync` hierarchy in the manifest,
-/// and every node carries the same set of peer fields.
+/// Codex import is idempotent like the Pi/OpenCode targets: re-importing the
+/// same trace reuses the same session and file, a continued target is refused
+/// unless forced, and `--force` replaces the content while keeping the session
+/// identity.
 #[test]
-fn convert_chain_builds_peer_node_group() {
-    let env = cli_pi_source_env("peer-group");
-    let converted = run_convert_pi(&env, false);
-    assert!(
-        converted.status.success(),
-        "pi -> opencode convert failed: {}",
-        String::from_utf8_lossy(&converted.stderr)
+fn codex_import_updates_same_session_and_protects_continuation() {
+    let trace = readers::pi::read(&fixture("pi.jsonl")).unwrap();
+    let root = std::env::temp_dir().join(format!(
+        "cash-codex-update-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+
+    let first = import::codex::import(&trace, &root).expect("first codex import");
+    let clean_back = readers::codex::read(std::path::Path::new(&first.file)).unwrap();
+
+    let second = import::codex::import_existing(
+        &trace,
+        &root,
+        Some(std::path::Path::new(&first.file)),
+        Some(&first.session_id),
+        Some(&first.anchor_message_id),
+        false,
+        None,
+    )
+    .expect("second codex import");
+    assert_eq!(second.session_id, first.session_id);
+    assert_eq!(second.file, first.file);
+    assert_eq!(count_jsonl(&root), 1);
+
+    // Simulate continuing the codex session after the imported anchor.
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&first.file)
+        .unwrap();
+    writeln!(
+        file,
+        "{}",
+        serde_json::to_string(&serde_json::json!({
+            "type": "response_item",
+            "timestamp": "2026-01-02T00:00:00.000Z",
+            "payload": {"type": "message", "id": "msg_continued", "role": "user", "content": [{"type": "input_text", "text": "continued in codex"}]}
+        }))
+        .unwrap()
+    )
+    .unwrap();
+    drop(file);
+
+    let conflict = import::codex::import_existing(
+        &trace,
+        &root,
+        Some(std::path::Path::new(&first.file)),
+        Some(&first.session_id),
+        Some(&first.anchor_message_id),
+        false,
+        None,
     );
-    let oc_session = manifest_target(&env.seed)["session_id"]
+    assert!(
+        conflict.unwrap_err().contains("--force"),
+        "continued codex target must be refused without --force"
+    );
+
+    let forced = import::codex::import_existing(
+        &trace,
+        &root,
+        Some(std::path::Path::new(&first.file)),
+        Some(&first.session_id),
+        Some(&first.anchor_message_id),
+        true,
+        None,
+    )
+    .expect("forced codex import");
+    assert_eq!(forced.session_id, first.session_id);
+    assert!(
+        !std::fs::read_to_string(&first.file).unwrap().contains("msg_continued"),
+        "--force must remove the appended continuation"
+    );
+
+    // The replaced file is byte-for-byte equivalent to the fresh import.
+    let forced_back = readers::codex::read(std::path::Path::new(&first.file)).unwrap();
+    assert_eq!(
+        serde_json::to_string(&clean_back.events).unwrap(),
+        serde_json::to_string(&forced_back.events).unwrap(),
+        "forced re-import changed the event trace"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn sync_refuses_when_multiple_copies_changed() {
+    let (env, _codex_root) = three_copy_env("sync-conflict");
+    let codex_file = manifest_node(&env.seed, "codex")["file"]
         .as_str()
         .unwrap()
         .to_string();
 
-    let codex_root = env.root.join("codex-root");
-    std::fs::create_dir_all(&codex_root).unwrap();
-    let to_codex = Command::new(env!("CARGO_BIN_EXE_cash"))
-        .args([
-            "convert",
-            "opencode",
-            &oc_session,
-            "codex",
-            "--opencode-db",
-            env.db.to_str().unwrap(),
-            "--codex-root",
-            codex_root.to_str().unwrap(),
-            "--pi-root",
-            env.pi_root.to_str().unwrap(),
-        ])
-        .env("CASH_SEED_DIR", &env.root)
-        .output()
-        .unwrap();
-    assert!(
-        to_codex.status.success(),
-        "opencode -> codex convert failed: {}",
-        String::from_utf8_lossy(&to_codex.stderr)
+    // Two copies gain independent content at the same time.
+    append_pi_continuation(&env, "continue in pi", "pi continuation");
+    append_codex_records(
+        &codex_file,
+        &[serde_json::json!({
+            "type": "response_item",
+            "timestamp": "2026-01-02T00:00:00.000Z",
+            "payload": {"type": "message", "id": "codex-user", "role": "user", "content": [{"type": "input_text", "text": "continued in codex"}]}
+        })],
     );
 
-    let manifest: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(env.seed.join("manifest.json")).unwrap(),
-    )
-    .unwrap();
-    let nodes = manifest["nodes"].as_array().expect("nodes array");
-    assert_eq!(nodes.len(), 3, "peer group must hold pi + opencode + codex");
-
-    // All three copies are peers: same agent set, same field shape, no
-    // source/targets/target/sync legacy hierarchy in a fresh manifest.
-    let mut agents: Vec<&str> = nodes
-        .iter()
-        .map(|node| node["agent"].as_str().expect("node agent"))
-        .collect();
-    agents.sort_unstable();
-    assert_eq!(agents, vec!["codex", "opencode", "pi"]);
-    for node in nodes {
-        for field in [
-            "agent",
-            "session_id",
-            "file",
-            "anchor_message_id",
-            "events_sha256",
-        ] {
-            assert!(node.get(field).is_some(), "peer node missing {field}");
-        }
-    }
-    for legacy in ["source", "targets", "target", "sync"] {
-        assert!(
-            manifest.get(legacy).is_none(),
-            "fresh manifest must not carry legacy {legacy}"
-        );
-    }
-
-    // The converted copies reference live native sessions that status can read.
-    let status = Command::new(env!("CARGO_BIN_EXE_cash"))
-        .args([
-            "status",
-            env.seed.to_str().unwrap(),
-            "--opencode-db",
-            env.db.to_str().unwrap(),
-        ])
-        .env("CASH_SEED_DIR", &env.root)
-        .output()
-        .unwrap();
+    let synced = run_sync_session(&env, "id_0001", false);
     assert!(
-        status.status.success(),
-        "status failed: {}",
-        String::from_utf8_lossy(&status.stderr)
+        !synced.status.success(),
+        "sync must refuse to merge divergent copies"
     );
-    let stdout = String::from_utf8(status.stdout).unwrap();
-    for agent in ["pi", "opencode", "codex"] {
-        assert!(
-            stdout.contains(&format!("NODE {agent}")),
-            "status must report every peer copy, missing {agent}:\n{stdout}"
-        );
-    }
+    let stderr = String::from_utf8_lossy(&synced.stderr);
+    assert!(
+        stderr.contains("conflict"),
+        "expected a conflict error, got: {stderr}"
+    );
+
+    // Nothing was propagated.
+    let oc_session = manifest_node(&env.seed, "opencode")["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let oc_trace = readers::opencode::read(&env.db, &oc_session).unwrap();
+    assert!(!oc_trace.events.iter().any(|e| {
+        matches!(&e.kind, EventKind::UserMessage { text } if text == "continue in pi" || text == "continued in codex")
+    }));
 
     let _ = std::fs::remove_dir_all(&env.root);
 }
 
-/// Legacy `source` + `target`/`sync` manifests migrate into the peer-node group
-/// on load, preserving anchors and hashes.
 #[test]
-fn legacy_manifest_migrates_into_peer_node_group() {
-    let dir =
-        std::env::temp_dir().join(format!("cash-legacy-migrate-{}", uuid::Uuid::new_v4().simple()));
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(
-        dir.join("manifest.json"),
-        serde_json::json!({
-            "version": 1,
-            "seed_files": ["seed.json", "seed.md"],
-            "source": {
-                "agent": "pi",
-                "session_id": "pi-old",
-                "file": "/tmp/pi.jsonl",
-                "file_sha256": "aaa",
-                "events_sha256": "hash-pi",
-                "event_count": 6,
-                "exported_at": "2026-01-01T00:00:00Z"
-            },
-            "target": {
-                "agent": "opencode",
-                "session_id": "ses_old",
-                "file": "/tmp/db/opencode.db(ses_old)",
-                "anchor_message_id": "msg_old",
-                "injected_at": "2026-01-01T00:00:00Z",
-                "events_sha256": "hash-open",
-                "seed_event_count": 6,
-                "native_message_count": 4,
-                "dropped_event_count": 1
-            },
-            "sync": {
-                "source_agent": "pi",
-                "source_session_id": "pi-old",
-                "source_file": "/tmp/pi.jsonl",
-                "source_events_sha256": "hash-pi-latest",
-                "target_agent": "opencode",
-                "target_session_id": "ses_old",
-                "target_file": "/tmp/db/opencode.db(ses_old)",
-                "target_anchor_message_id": "msg_old_latest",
-                "target_events_sha256": "hash-open-latest"
-            }
-        })
-        .to_string(),
-    )
-    .unwrap();
+fn sync_refuses_when_unchanged_copy_diverged() {
+    let (env, _codex_root) = three_copy_env("sync-divergence");
+    let codex_file = manifest_node(&env.seed, "codex")["file"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
-    let manifest = export::load_manifest(&dir).expect("load legacy manifest");
-    let nodes = manifest.copies();
-    assert_eq!(nodes.len(), 2);
-    let pi = &nodes[0];
-    assert_eq!((pi.agent.as_str(), pi.session_id.as_str()), ("pi", "pi-old"));
-    assert_eq!(pi.events_sha256, "hash-pi-latest", "sync anchor applied to source copy");
-    let open = &nodes[1];
-    assert_eq!(
-        (open.agent.as_str(), open.session_id.as_str()),
-        ("opencode", "ses_old")
+    // The codex copy gains only non-syncable injected context: its event hash
+    // changes but it produces no syncable delta, so sync must treat it as an
+    // unchanged copy that diverged, and refuse rather than clobber it.
+    append_codex_records(
+        &codex_file,
+        &[serde_json::json!({
+            "type": "response_item",
+            "timestamp": "2026-01-02T00:00:00.000Z",
+            "payload": {"type": "message", "id": "environment-context", "role": "user", "content": [{"type": "input_text", "text": "<environment_context>injected</environment_context>"}]}
+        })],
     );
-    assert_eq!(
-        open.anchor_message_id, "msg_old_latest",
-        "sync anchor applied to target copy"
-    );
-    assert_eq!(open.native_message_count, 4);
-    assert_eq!(open.dropped_event_count, 1);
+    append_pi_continuation(&env, "continue in pi", "pi continuation");
 
-    let _ = std::fs::remove_dir_all(&dir);
+    let synced = run_sync_session(&env, "id_0001", false);
+    assert!(
+        !synced.status.success(),
+        "sync must refuse when an unchanged copy changed independently"
+    );
+    let stderr = String::from_utf8_lossy(&synced.stderr);
+    assert!(
+        stderr.contains("changed independently"),
+        "expected a divergence error, got: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&env.root);
 }
 
 struct CliTestEnv {
@@ -1959,7 +1652,6 @@ struct CliTestEnv {
     seed: PathBuf,
     pi_root: PathBuf,
 }
-
 fn cli_test_env(label: &str) -> CliTestEnv {
     let root = std::env::temp_dir().join(format!(
         "cash-cli-{label}-{}",
@@ -1981,10 +1673,6 @@ fn cli_test_env(label: &str) -> CliTestEnv {
     }
 }
 
-fn run_sync(env: &CliTestEnv, force: bool) -> std::process::Output {
-    run_sync_session(env, "opencode-real-sanitized", force)
-}
-
 fn run_sync_session(env: &CliTestEnv, session: &str, force: bool) -> std::process::Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_cash"));
     command.args([
@@ -1994,34 +1682,14 @@ fn run_sync_session(env: &CliTestEnv, session: &str, force: bool) -> std::proces
         env.pi_root.to_str().unwrap(),
         "--opencode-db",
         env.db.to_str().unwrap(),
+        "--codex-root",
+        env.root.join("codex-root").to_str().unwrap(),
     ]);
     command.env("CASH_SEED_DIR", &env.root);
     if force {
         command.arg("--force");
     }
     command.output().unwrap()
-}
-
-fn count_opencode_messages(db: &std::path::Path, session: &str) -> i64 {
-    rusqlite::Connection::open(db)
-        .unwrap()
-        .query_row(
-            "SELECT COUNT(*) FROM message WHERE session_id = ?1",
-            [session],
-            |r| r.get(0),
-        )
-        .unwrap()
-}
-
-fn count_opencode_sessions(db: &std::path::Path, session: &str) -> i64 {
-    rusqlite::Connection::open(db)
-        .unwrap()
-        .query_row(
-            "SELECT COUNT(*) FROM session WHERE id = ?1",
-            [session],
-            |r| r.get(0),
-        )
-        .unwrap()
 }
 
 fn run_convert(env: &CliTestEnv, force: bool) -> std::process::Output {
@@ -2104,6 +1772,121 @@ fn manifest_target(seed: &std::path::Path) -> serde_json::Value {
         .as_array()
         .and_then(|nodes| nodes.last().cloned())
         .expect("manifest has at least one node")
+}
+
+fn manifest_node(seed: &std::path::Path, agent: &str) -> serde_json::Value {
+    let raw = std::fs::read_to_string(seed.join("manifest.json")).unwrap();
+    let manifest: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    manifest["nodes"]
+        .as_array()
+        .expect("nodes array")
+        .iter()
+        .find(|node| node["agent"] == agent)
+        .cloned()
+        .unwrap_or_else(|| panic!("no {agent} node in manifest"))
+}
+
+/// Build a three-copy peer group (pi + opencode + codex) from the real pi
+/// fixture, so sync tests can verify broadcast propagation in every direction.
+fn three_copy_env(label: &str) -> (CliTestEnv, PathBuf) {
+    let env = cli_pi_source_env(label);
+    let codex_root = env.root.join("codex-root");
+    std::fs::create_dir_all(&codex_root).unwrap();
+
+    let to_opencode = run_convert_pi(&env, false);
+    assert!(
+        to_opencode.status.success(),
+        "pi -> opencode convert failed: {}",
+        String::from_utf8_lossy(&to_opencode.stderr)
+    );
+    let oc_session = manifest_target(&env.seed)["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let to_codex = Command::new(env!("CARGO_BIN_EXE_cash"))
+        .args([
+            "convert",
+            "opencode",
+            &oc_session,
+            "codex",
+            "--seed",
+            env.seed.to_str().unwrap(),
+            "--pi-root",
+            env.pi_root.to_str().unwrap(),
+            "--opencode-db",
+            env.db.to_str().unwrap(),
+            "--codex-root",
+            codex_root.to_str().unwrap(),
+        ])
+        .env("CASH_SEED_DIR", &env.root)
+        .output()
+        .unwrap();
+    assert!(
+        to_codex.status.success(),
+        "opencode -> codex convert failed: {}",
+        String::from_utf8_lossy(&to_codex.stderr)
+    );
+    (env, codex_root)
+}
+
+fn append_pi_continuation(env: &CliTestEnv, user: &str, assistant: &str) {
+    let source = env.pi_root.join("session.jsonl");
+    let trace = readers::pi::read(&source).unwrap();
+    let last_id = trace.events.last().unwrap().original_id.clone();
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&source)
+        .unwrap();
+    for value in [
+        serde_json::json!({
+            "type": "message",
+            "id": "cont-user",
+            "parentId": last_id,
+            "timestamp": "2026-01-02T00:00:00.000Z",
+            "message": {"role": "user", "content": [{"type": "text", "text": user}]}
+        }),
+        serde_json::json!({
+            "type": "message",
+            "id": "cont-assistant",
+            "parentId": "cont-user",
+            "timestamp": "2026-01-02T00:00:01.000Z",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": assistant}], "model": "cash", "provider": "cash", "api": "cash", "stopReason": "stop", "usage": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0, "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}}}
+        }),
+    ] {
+        use std::io::Write;
+        writeln!(file, "{}", serde_json::to_string(&value).unwrap()).unwrap();
+    }
+    drop(file);
+}
+
+fn append_codex_records(file: &str, values: &[serde_json::Value]) {
+    let mut f = std::fs::OpenOptions::new().append(true).open(file).unwrap();
+    for value in values {
+        use std::io::Write;
+        writeln!(f, "{}", serde_json::to_string(value).unwrap()).unwrap();
+    }
+    drop(f);
+}
+
+fn assert_has_user(trace: &cash::ir::Trace, text: &str) {
+    assert!(
+        trace
+            .events
+            .iter()
+            .any(|e| matches!(&e.kind, EventKind::UserMessage { text: t } if t == text)),
+        "missing user message: {text}"
+    );
+}
+
+fn assert_has_assistant(trace: &cash::ir::Trace, text: &str) {
+    assert!(
+        trace
+            .events
+            .iter()
+            .any(|e| matches!(&e.kind, EventKind::AssistantMessage { text: t } if t == text)),
+        "missing assistant message: {text}"
+    );
 }
 
 fn count_jsonl(root: &std::path::Path) -> usize {

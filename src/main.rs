@@ -669,12 +669,27 @@ fn import_and_update_manifest(
             model_override,
         )?,
     };
+    // Record the copy's own event hash as materialized in the target, not the
+    // source trace hash: a target that drops events (e.g. Codex/OpenCode drop
+    // model_change) would otherwise never match its file on re-read, and `sync`
+    // would treat a pristine copy as independently diverged.
+    let events_sha256 = match kind {
+        AgentKind::OpenCode => export::hash_trace_events(
+            &readers::opencode::read(&opts.opencode_db, &result.session_id)?.events,
+        ),
+        AgentKind::Pi => {
+            export::hash_trace_events(&readers::pi::read(Path::new(&result.file))?.events)
+        }
+        AgentKind::Codex => {
+            export::hash_trace_events(&readers::codex::read(Path::new(&result.file))?.events)
+        }
+    };
     manifest.upsert_node(export::NodeRef {
         agent: kind.as_str().into(),
         session_id: result.session_id.clone(),
         file: result.file.clone(),
         anchor_message_id: result.anchor_message_id.clone(),
-        events_sha256: export::hash_trace_events(&trace.events),
+        events_sha256,
         injected_at: chrono::Utc::now().to_rfc3339(),
         seed_event_count: trace.events.len(),
         native_message_count: result.message_count,
