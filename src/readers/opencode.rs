@@ -13,7 +13,7 @@ type SessionRow = (
     Option<String>,
     Option<i64>,
 );
-type ListRow = (String, String, Option<String>, Option<i64>);
+pub type ListRow = (String, String, Option<String>, Option<i64>);
 
 /// Parse a session from the OpenCode SQLite store (default ~/.local/share/opencode/opencode.db).
 pub fn read(db_path: &Path, session_id: &str) -> Result<Trace, String> {
@@ -196,7 +196,7 @@ pub fn read(db_path: &Path, session_id: &str) -> Result<Trace, String> {
 }
 
 /// List available sessions from the OpenCode SQLite store.
-pub fn list_sessions(db_path: &Path) -> Result<Vec<ListRow>, String> {
+pub fn list_session_summaries(db_path: &Path) -> Result<Vec<super::SessionSummary>, String> {
     let conn = Connection::open(db_path).map_err(|e| format!("open {}: {e}", db_path.display()))?;
     let mut stmt = conn
         .prepare(
@@ -204,18 +204,34 @@ pub fn list_sessions(db_path: &Path) -> Result<Vec<ListRow>, String> {
         )
         .map_err(|e| e.to_string())?;
     let rows = stmt
-        .query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, Option<String>>(2)?,
-                r.get::<_, Option<i64>>(3)?,
-            ))
+        .query_map([], |row| {
+            Ok(super::SessionSummary {
+                session_id: row.get(0)?,
+                cwd: row.get(1)?,
+                title: row.get(2)?,
+                time: row.get(3)?,
+                time_kind: super::SessionTimeKind::Updated,
+            })
         })
         .map_err(|e| e.to_string())?;
-    let mut out = Vec::new();
-    for r in rows {
-        out.push(r.map_err(|e| e.to_string())?);
-    }
-    Ok(out)
+    let mut summaries = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    super::sort_session_summaries(&mut summaries);
+    Ok(summaries)
+}
+
+/// Compatibility view used by callers that still consume the old tuple shape.
+pub fn list_sessions(db_path: &Path) -> Result<Vec<ListRow>, String> {
+    Ok(list_session_summaries(db_path)?
+        .into_iter()
+        .map(|summary| {
+            (
+                summary.session_id,
+                summary.cwd.unwrap_or_default(),
+                summary.title,
+                summary.time,
+            )
+        })
+        .collect())
 }

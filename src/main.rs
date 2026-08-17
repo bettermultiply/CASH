@@ -114,33 +114,19 @@ fn run(cli: Cli) -> Result<(), String> {
             let kind = parse_agent(&agent)?;
             let stdout = std::io::stdout();
             let mut out = stdout.lock();
-            match kind {
-                AgentKind::Codex => {
-                    let root = codex_root.unwrap_or_else(default_codex_root);
-                    for (stem, path) in readers::codex::list_sessions(&root)? {
-                        if !emit_line(&mut out, &format!("{stem}\t{}", path.display()))? {
-                            return Ok(());
-                        }
-                    }
-                }
+            let sessions = match kind {
+                AgentKind::Codex => readers::codex::list_session_summaries(
+                    &codex_root.unwrap_or_else(default_codex_root),
+                )?,
                 AgentKind::Pi => {
-                    let root = pi_root.unwrap_or_else(default_pi_root);
-                    for (stem, path) in readers::pi::list_sessions(&root)? {
-                        if !emit_line(&mut out, &format!("{stem}\t{}", path.display()))? {
-                            return Ok(());
-                        }
-                    }
+                    readers::pi::list_session_summaries(&pi_root.unwrap_or_else(default_pi_root))?
                 }
-                AgentKind::OpenCode => {
-                    let db = opencode_db.unwrap_or_else(default_opencode_db);
-                    for (id, dir, title, updated) in readers::opencode::list_sessions(&db)? {
-                        let t = title.unwrap_or_default();
-                        let ts = updated.map(util::format_ms).unwrap_or_default();
-                        if !emit_line(&mut out, &format!("{id}\t{ts}\t{t}\t{dir}"))? {
-                            return Ok(());
-                        }
-                    }
-                }
+                AgentKind::OpenCode => readers::opencode::list_session_summaries(
+                    &opencode_db.unwrap_or_else(default_opencode_db),
+                )?,
+            };
+            if !emit_session_list(&mut out, kind, &sessions)? {
+                return Ok(());
             }
             Ok(())
         }
@@ -461,6 +447,99 @@ fn walk_seed_dirs(dir: &Path, best: &mut Option<(std::time::SystemTime, PathBuf)
 
 fn yesno(b: bool) -> &'static str {
     if b { "yes" } else { "NO" }
+}
+
+fn emit_session_list(
+    out: &mut impl Write,
+    kind: AgentKind,
+    sessions: &[readers::SessionSummary],
+) -> Result<bool, String> {
+    let agent = agent_display_name(kind);
+    if sessions.is_empty() {
+        return emit_line(out, &format!("No {agent} sessions found."));
+    }
+
+    if !emit_line(
+        out,
+        &format!("{agent} sessions: {} (newest first)", sessions.len()),
+    )? {
+        return Ok(false);
+    }
+
+    for (index, session) in sessions.iter().enumerate() {
+        let title = session
+            .title
+            .as_deref()
+            .map(|text| compact_text(text, 96))
+            .filter(|text| !text.is_empty())
+            .unwrap_or_else(|| "(untitled session)".to_string());
+        let time = session
+            .time
+            .map(util::format_local_ms)
+            .unwrap_or_else(|| "(unknown)".to_string());
+        let workspace = session
+            .cwd
+            .as_deref()
+            .map(human_path)
+            .unwrap_or_else(|| "(unknown)".to_string());
+        let lines = [
+            String::new(),
+            format!("{}. {title}", index + 1),
+            format!("   {}:   {time}", session.time_kind.label()),
+            format!("   Workspace: {workspace}"),
+            format!("   Session:   {}", compact_text(&session.session_id, 128)),
+        ];
+        for line in lines {
+            if !emit_line(out, &line)? {
+                return Ok(false);
+            }
+        }
+    }
+
+    Ok(true)
+}
+
+fn agent_display_name(kind: AgentKind) -> &'static str {
+    match kind {
+        AgentKind::Codex => "Codex",
+        AgentKind::OpenCode => "OpenCode",
+        AgentKind::Pi => "Pi",
+    }
+}
+
+fn human_path(path: &str) -> String {
+    let path = Path::new(path);
+    let home = config::home_dir();
+    let displayed = match path.strip_prefix(&home) {
+        Ok(relative) if relative.as_os_str().is_empty() => "~".to_string(),
+        Ok(relative) => format!("~/{}", relative.display()),
+        Err(_) => path.display().to_string(),
+    };
+    compact_text(&displayed, 128)
+}
+
+fn compact_text(text: &str, max_chars: usize) -> String {
+    let mut normalized = String::new();
+    let mut pending_space = false;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            pending_space = !normalized.is_empty();
+        } else if !ch.is_control() {
+            if pending_space {
+                normalized.push(' ');
+                pending_space = false;
+            }
+            normalized.push(ch);
+        }
+    }
+
+    let mut chars = normalized.chars();
+    let prefix: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{prefix}...")
+    } else {
+        prefix
+    }
 }
 
 fn emit_line(out: &mut impl Write, line: &str) -> Result<bool, String> {

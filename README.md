@@ -37,9 +37,23 @@ cargo run -- convert opencode <OPENCODE_SESSION_ID> pi
 先列出可用 session：
 
 ```bash
+cargo run -- list codex
 cargo run -- list opencode
 cargo run -- list pi
 ```
+
+三个列表使用同一套可读摘要格式并按最近时间排序。Pi/Codex 显示首条真实用户消息和开始时间，OpenCode 显示原生标题和最后更新时间；时间统一使用本地时区：
+
+```text
+Pi sessions: 2 (newest first)
+
+1. 修复登录接口的超时问题
+   Started:   2026-08-17 12:22 +08:00
+   Workspace: ~/projects/example
+   Session:   01a00df5-2cfd-7fc2-b146-2d7c5185d0b3
+```
+
+`Session` 后的原生 ID 可以直接传给 `export` 或 `convert`；Pi/Codex 旧版列表中的文件 stem 仍然兼容。
 
 ### 指定路径
 

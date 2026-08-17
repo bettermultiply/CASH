@@ -215,6 +215,90 @@ fn codex_native(payload: &Value) -> Option<Value> {
         .map(|v| json!({ "internal": v }))
 }
 
+/// List Codex sessions using the native ID and first real user message.
+pub fn list_session_summaries(root: &Path) -> Result<Vec<super::SessionSummary>, String> {
+    let mut summaries = list_sessions(root)?
+        .into_iter()
+        .map(|(selector, path)| summarize_session(selector, path))
+        .collect::<Result<Vec<_>, _>>()?;
+    super::sort_session_summaries(&mut summaries);
+    Ok(summaries)
+}
+
+fn summarize_session(selector: String, path: PathBuf) -> Result<super::SessionSummary, String> {
+    let mut session_id = None;
+    let mut started_at = None;
+    let mut cwd = None;
+    let mut title = None;
+
+    super::scan_jsonl_until(&path, |value| {
+        let record_type = value.get("type").and_then(Value::as_str);
+        let payload = &value["payload"];
+        if record_type == Some("session_meta") {
+            session_id = payload
+                .get("id")
+                .or_else(|| payload.get("session_id"))
+                .and_then(Value::as_str)
+                .map(String::from);
+            started_at = payload
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .or_else(|| value.get("timestamp").and_then(Value::as_str))
+                .and_then(parse_ts);
+            cwd = payload.get("cwd").and_then(Value::as_str).map(String::from);
+        } else if title.is_none()
+            && record_type == Some("response_item")
+            && payload.get("type").and_then(Value::as_str) == Some("message")
+            && payload.get("role").and_then(Value::as_str) == Some("user")
+        {
+            let text = collect_text(&payload["content"]);
+            if !text.trim().is_empty() && !is_context_message(&text) {
+                title = Some(text);
+            }
+        } else if title.is_none()
+            && record_type == Some("event_msg")
+            && payload.get("type").and_then(Value::as_str) == Some("user_message")
+            && let Some(message) = payload.get("message").and_then(Value::as_str)
+            && !message.trim().is_empty()
+        {
+            title = Some(message.to_string());
+        }
+        session_id.is_some() && title.is_some()
+    })?;
+
+    Ok(super::SessionSummary {
+        session_id: session_id.unwrap_or(selector),
+        time: started_at,
+        time_kind: super::SessionTimeKind::Started,
+        cwd,
+        title,
+    })
+}
+
+fn is_context_message(text: &str) -> bool {
+    let text = text.trim_start();
+    text.starts_with("<environment_context>")
+        || text.starts_with("# AGENTS.md instructions")
+        || text.starts_with("<user_instructions>")
+}
+
+pub(super) fn native_session_id(path: &Path) -> Result<Option<String>, String> {
+    let mut session_id = None;
+    super::scan_jsonl_until(path, |value| {
+        if value.get("type").and_then(Value::as_str) != Some("session_meta") {
+            return false;
+        }
+        let payload = &value["payload"];
+        session_id = payload
+            .get("id")
+            .or_else(|| payload.get("session_id"))
+            .and_then(Value::as_str)
+            .map(String::from);
+        true
+    })?;
+    Ok(session_id)
+}
+
 /// Recursively list rollout JSONL files under a sessions root.
 pub fn list_sessions(root: &Path) -> Result<Vec<(String, PathBuf)>, String> {
     let mut out = Vec::new();

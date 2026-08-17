@@ -259,6 +259,79 @@ fn message_native(message: &Value) -> Option<Value> {
     }
 }
 
+/// List Pi sessions with the small amount of metadata needed by the CLI.
+///
+/// Only the prefix through the first user message is parsed, which keeps the
+/// listing cheap even when session transcripts are large.
+pub fn list_session_summaries(root: &Path) -> Result<Vec<super::SessionSummary>, String> {
+    let mut summaries = list_sessions(root)?
+        .into_iter()
+        .map(|(selector, path)| summarize_session(selector, path))
+        .collect::<Result<Vec<_>, _>>()?;
+    super::sort_session_summaries(&mut summaries);
+    Ok(summaries)
+}
+
+fn summarize_session(selector: String, path: PathBuf) -> Result<super::SessionSummary, String> {
+    let mut session_id = None;
+    let mut started_at = None;
+    let mut cwd = None;
+    let mut title = None;
+
+    super::scan_jsonl_until(&path, |value| {
+        match value.get("type").and_then(Value::as_str) {
+            Some("session") => {
+                session_id = value.get("id").and_then(Value::as_str).map(String::from);
+                started_at = value
+                    .get("timestamp")
+                    .and_then(Value::as_str)
+                    .and_then(crate::util::parse_ts);
+                cwd = value.get("cwd").and_then(Value::as_str).map(String::from);
+            }
+            Some("message")
+                if title.is_none()
+                    && value
+                        .get("message")
+                        .and_then(|message| message.get("role"))
+                        .and_then(Value::as_str)
+                        == Some("user") =>
+            {
+                let content = value["message"]
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let text = join_text(&content);
+                if !text.trim().is_empty() {
+                    title = Some(text);
+                }
+            }
+            _ => {}
+        }
+        session_id.is_some() && title.is_some()
+    })?;
+
+    Ok(super::SessionSummary {
+        session_id: session_id.unwrap_or(selector),
+        time: started_at,
+        time_kind: super::SessionTimeKind::Started,
+        cwd,
+        title,
+    })
+}
+
+pub(super) fn native_session_id(path: &Path) -> Result<Option<String>, String> {
+    let mut session_id = None;
+    super::scan_jsonl_until(path, |value| {
+        if value.get("type").and_then(Value::as_str) != Some("session") {
+            return false;
+        }
+        session_id = value.get("id").and_then(Value::as_str).map(String::from);
+        true
+    })?;
+    Ok(session_id)
+}
+
 /// Recursively list session JSONL files under a Pi sessions root.
 pub fn list_sessions(root: &Path) -> Result<Vec<(String, PathBuf)>, String> {
     let mut out = Vec::new();

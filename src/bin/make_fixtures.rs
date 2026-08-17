@@ -81,8 +81,8 @@ fn pick_jsonl(root: &Path, needles: &[&str]) -> Option<PathBuf> {
 }
 
 fn pick_opencode_session(db: &Path) -> Result<String, String> {
-    for (id, _, _, _) in readers::opencode::list_sessions(db)? {
-        let trace = readers::opencode::read(db, &id)?;
+    for summary in readers::opencode::list_session_summaries(db)? {
+        let trace = readers::opencode::read(db, &summary.session_id)?;
         let has_tool = trace
             .events
             .iter()
@@ -92,7 +92,7 @@ fn pick_opencode_session(db: &Path) -> Result<String, String> {
             .iter()
             .any(|e| matches!(e.kind, EventKind::Reasoning { .. }));
         if trace.events.len() > 20 && has_tool && has_reasoning {
-            return Ok(id);
+            return Ok(summary.session_id);
         }
     }
     Err("no suitable opencode session found".into())

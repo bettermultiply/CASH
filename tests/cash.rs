@@ -113,6 +113,267 @@ fn pi_reader_extracts_events() {
 }
 
 #[test]
+fn list_pi_prints_human_readable_summaries_and_resolvable_ids() {
+    let root = std::env::temp_dir().join(format!("cash-list-pi-{}", uuid::Uuid::new_v4().simple()));
+    let sessions = root.join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+
+    write_jsonl_values(
+        &sessions.join("2026-01-01T00-00-00-000Z_ugly-old-selector.jsonl"),
+        &[
+            serde_json::json!({
+                "type": "session",
+                "version": 3,
+                "id": "pi-old",
+                "timestamp": "2026-01-01T00:00:00.000Z",
+                "cwd": "/tmp/old-work"
+            }),
+            serde_json::json!({
+                "type": "message",
+                "id": "old-message",
+                "parentId": null,
+                "timestamp": "2026-01-01T00:00:01.000Z",
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "older request"}]
+                }
+            }),
+        ],
+    );
+    write_jsonl_values(
+        &sessions.join("2026-01-02T00-00-00-000Z_ugly-new-selector.jsonl"),
+        &[
+            serde_json::json!({
+                "type": "session",
+                "version": 3,
+                "id": "pi-new",
+                "timestamp": "2026-01-02T00:00:00.000Z",
+                "cwd": "/tmp/new-work"
+            }),
+            serde_json::json!({
+                "type": "message",
+                "id": "new-message",
+                "parentId": null,
+                "timestamp": "2026-01-02T00:00:01.000Z",
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "newest\nrequest\twith spacing"}]
+                }
+            }),
+        ],
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cash"))
+        .args(["list", "pi", "--pi-root", sessions.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "list failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Pi sessions: 2 (newest first)"));
+    assert!(stdout.contains("1. newest request with spacing"));
+    assert!(stdout.contains("2. older request"));
+    assert!(stdout.contains("Started:   2026-01-02"));
+    assert!(stdout.contains("Workspace: /tmp/new-work"));
+    assert!(stdout.contains("Session:   pi-new"));
+    assert!(!stdout.contains("ugly-new-selector"));
+    assert!(!stdout.contains(".jsonl"));
+
+    let seed = root.join("seed");
+    let export = Command::new(env!("CARGO_BIN_EXE_cash"))
+        .args([
+            "export",
+            "pi",
+            "pi-new",
+            "--pi-root",
+            sessions.to_str().unwrap(),
+            "--out",
+            seed.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        export.status.success(),
+        "export by listed ID failed: {}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+    assert!(seed.join("manifest.json").exists());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn list_codex_prints_human_readable_summaries_and_resolvable_ids() {
+    let root =
+        std::env::temp_dir().join(format!("cash-list-codex-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&root).unwrap();
+
+    write_jsonl_values(
+        &root.join("rollout-ugly-old-selector.jsonl"),
+        &[
+            serde_json::json!({
+                "type": "session_meta",
+                "timestamp": "2026-01-01T00:00:00.000Z",
+                "payload": {
+                    "id": "codex-old",
+                    "timestamp": "2026-01-01T00:00:00.000Z",
+                    "cwd": "/tmp/old-codex"
+                }
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "timestamp": "2026-01-01T00:00:01.000Z",
+                "payload": {
+                    "id": "old-message",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "older codex request"}]
+                }
+            }),
+        ],
+    );
+    write_jsonl_values(
+        &root.join("rollout-ugly-new-selector.jsonl"),
+        &[
+            serde_json::json!({
+                "type": "session_meta",
+                "timestamp": "2026-01-02T00:00:00.000Z",
+                "payload": {
+                    "id": "codex-new",
+                    "timestamp": "2026-01-02T00:00:00.000Z",
+                    "cwd": "/tmp/new-codex"
+                }
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "timestamp": "2026-01-02T00:00:01.000Z",
+                "payload": {
+                    "id": "context-message",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{
+                        "type": "input_text",
+                        "text": "<environment_context>injected metadata</environment_context>"
+                    }]
+                }
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "timestamp": "2026-01-02T00:00:02.000Z",
+                "payload": {
+                    "id": "new-message",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "newest codex request"}]
+                }
+            }),
+        ],
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cash"))
+        .args(["list", "codex", "--codex-root", root.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "list failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Codex sessions: 2 (newest first)"));
+    assert!(stdout.contains("1. newest codex request"));
+    assert!(stdout.contains("2. older codex request"));
+    assert!(stdout.contains("Started:   2026-01-02"));
+    assert!(stdout.contains("Workspace: /tmp/new-codex"));
+    assert!(stdout.contains("Session:   codex-new"));
+    assert!(!stdout.contains("injected metadata"));
+    assert!(!stdout.contains("ugly-new-selector"));
+    assert!(!stdout.contains(".jsonl"));
+
+    let seed = root.join("seed");
+    let export = Command::new(env!("CARGO_BIN_EXE_cash"))
+        .args([
+            "export",
+            "codex",
+            "codex-new",
+            "--codex-root",
+            root.to_str().unwrap(),
+            "--out",
+            seed.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        export.status.success(),
+        "export by listed ID failed: {}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+    assert!(seed.join("manifest.json").exists());
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn list_opencode_prints_human_readable_summaries() {
+    let root = std::env::temp_dir().join(format!(
+        "cash-list-opencode-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let db = root.join("opencode.db");
+    create_schema(&db);
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let older = cash::util::parse_ts("2026-01-01T00:00:00Z").unwrap();
+    let newer = cash::util::parse_ts("2026-01-02T00:00:00Z").unwrap();
+    for (id, directory, title, created, updated) in [
+        (
+            "opencode-old",
+            "/tmp/old-opencode",
+            "Older OpenCode session",
+            older,
+            older,
+        ),
+        (
+            "opencode-new",
+            "/tmp/new-opencode",
+            "Newest\nOpenCode session",
+            older,
+            newer,
+        ),
+    ] {
+        conn.execute(
+            "INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated) VALUES (?1, 'global', ?1, ?2, ?3, 'test', ?4, ?5)",
+            rusqlite::params![id, directory, title, created, updated],
+        )
+        .unwrap();
+    }
+    drop(conn);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cash"))
+        .args(["list", "opencode", "--opencode-db", db.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "list failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("OpenCode sessions: 2 (newest first)"));
+    assert!(stdout.contains("1. Newest OpenCode session"));
+    assert!(stdout.contains("2. Older OpenCode session"));
+    assert!(stdout.contains("Updated:   2026-01-02"));
+    assert!(stdout.contains("Workspace: /tmp/new-opencode"));
+    assert!(stdout.contains("Session:   opencode-new"));
+    assert!(!stdout.contains("opencode.db"));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn export_writes_seed_files_and_manifest() {
     let trace = readers::pi::read(&fixture("pi.jsonl")).unwrap();
     let dir = std::env::temp_dir().join(format!("cash-test-{}", uuid::Uuid::new_v4().simple()));
@@ -381,6 +642,17 @@ fn load_jsonl(path: &std::path::Path) -> Vec<serde_json::Value> {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect()
+}
+
+fn write_jsonl_values(path: &std::path::Path, values: &[serde_json::Value]) {
+    let mut raw = values
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+        .join("\n");
+    raw.push('\n');
+    std::fs::write(path, raw).unwrap();
 }
 
 #[test]

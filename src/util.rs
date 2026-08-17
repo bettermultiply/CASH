@@ -29,9 +29,20 @@ pub fn finish_meta(meta: &mut TraceMeta, events: &[Event]) {
     meta.events_sha256 = sha256_hex(&canonical);
 }
 
-/// Format epoch millis as a local RFC3339-ish string for listings.
+/// Format epoch millis as an RFC3339-ish string for listings.
 pub fn format_ms(ms: i64) -> String {
     let dt = chrono::DateTime::from_timestamp_millis(ms);
     dt.map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_else(|| ms.to_string())
+}
+
+/// Format epoch millis in the local timezone for human-facing listings.
+pub fn format_local_ms(ms: i64) -> String {
+    use chrono::TimeZone;
+
+    chrono::Local
+        .timestamp_millis_opt(ms)
+        .single()
+        .map(|d| d.format("%Y-%m-%d %H:%M %:z").to_string())
         .unwrap_or_else(|| ms.to_string())
 }

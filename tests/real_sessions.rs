@@ -111,10 +111,10 @@ fn pick_opencode_session(db: &Path) -> String {
     {
         return v;
     }
-    readers::opencode::list_sessions(db)
+    readers::opencode::list_session_summaries(db)
         .unwrap()
         .into_iter()
-        .map(|(id, _, _, _)| id)
+        .map(|summary| summary.session_id)
         .find(|id| {
             readers::opencode::read(db, id)
                 .map(|t| t.events.len() > 5)
