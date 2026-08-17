@@ -65,13 +65,21 @@ pub fn import_existing(
     // Events are the single representation; original_id is reused as the native
     // item id, and turn linkage preserved via the `native` bag.
     let (anchor, message_count) = {
-        let header = session_meta(&session_id, &cwd, &now);
+        let header = session_meta(&session_id, &cwd, &now, sessions_root);
         write_jsonl(&mut writer, &header)?;
 
         let mut anchor = String::new();
         let mut message_count = 0usize;
+        // Sibling events derived from one native record share `original_id`;
+        // every written Codex record needs a unique id, so the first event of a
+        // group keeps the source id and later ones get a deterministic `~N`
+        // suffix (the reader strips it again).
+        let mut seen: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let mut event_index = 0usize;
 
         for ev in &trace.events {
+            event_index += 1;
             let ts = rfc3339_ms(ev.time.unwrap_or_else(|| now.timestamp_millis()));
             // Restore the native turn linkage captured during extraction.
             let internal = ev
@@ -80,35 +88,80 @@ pub fn import_existing(
                 .and_then(|n| n.get("internal"))
                 .cloned()
                 .map(|v| json!({ "internal_chat_message_metadata_passthrough": v }));
-            let line = match &ev.kind {
+            let native_id = if ev.original_id.is_empty() {
+                format!("cash_evt_{event_index:05}")
+            } else {
+                let n = seen.entry(ev.original_id.clone()).or_insert(0);
+                *n += 1;
+                if *n == 1 {
+                    ev.original_id.clone()
+                } else {
+                    format!("{}~{}", ev.original_id, *n)
+                }
+            };
+            match &ev.kind {
                 EventKind::UserMessage { text } => {
                     let mut payload = json!({
                         "type": "message",
-                        "id": ev.original_id,
+                        "id": native_id,
                         "role": "user",
                         "content": [{"type": "input_text", "text": text}],
                     });
                     merge_internal(&mut payload, &internal);
-                    response_item(&ts, payload)
+                    write_jsonl(&mut writer, &response_item(&ts, payload))?;
+                    // Codex's resume picker and UI transcript discover user turns
+                    // from `event_msg user_message` records, not response items.
+                    write_jsonl(
+                        &mut writer,
+                        &event_msg(
+                            &ts,
+                            json!({
+                                "type": "user_message",
+                                "message": text,
+                                "images": [],
+                                "local_images": [],
+                                "audio": [],
+                                "local_audio": [],
+                                "text_elements": [],
+                            }),
+                        ),
+                    )?;
+                    anchor = native_id;
+                    message_count += 1;
                 }
                 EventKind::AssistantMessage { text } => {
                     let mut payload = json!({
                         "type": "message",
-                        "id": ev.original_id,
+                        "id": native_id,
                         "role": "assistant",
                         "content": [{"type": "output_text", "text": text}],
                     });
                     merge_internal(&mut payload, &internal);
-                    response_item(&ts, payload)
+                    write_jsonl(&mut writer, &response_item(&ts, payload))?;
+                    write_jsonl(
+                        &mut writer,
+                        &event_msg(
+                            &ts,
+                            json!({
+                                "type": "agent_message",
+                                "message": text,
+                                "memory_citation": null,
+                            }),
+                        ),
+                    )?;
+                    anchor = native_id;
+                    message_count += 1;
                 }
                 EventKind::Reasoning { text } => {
                     let mut payload = json!({
                         "type": "reasoning",
-                        "id": ev.original_id,
+                        "id": native_id,
                         "summary": [{"type": "summary_text", "text": text}],
                     });
                     merge_internal(&mut payload, &internal);
-                    response_item(&ts, payload)
+                    write_jsonl(&mut writer, &response_item(&ts, payload))?;
+                    anchor = native_id;
+                    message_count += 1;
                 }
                 EventKind::ToolCall {
                     id: call_id,
@@ -117,25 +170,29 @@ pub fn import_existing(
                 } => {
                     let mut payload = json!({
                         "type": "function_call",
-                        "id": ev.original_id,
+                        "id": native_id,
                         "name": name,
                         "arguments": arguments,
                         "call_id": call_id,
                     });
                     merge_internal(&mut payload, &internal);
-                    response_item(&ts, payload)
+                    write_jsonl(&mut writer, &response_item(&ts, payload))?;
+                    anchor = native_id;
+                    message_count += 1;
                 }
                 EventKind::ToolResult {
                     call_id, output, ..
                 } => {
                     let mut payload = json!({
                         "type": "function_call_output",
-                        "id": ev.original_id,
+                        "id": native_id,
                         "call_id": call_id,
                         "output": [{"type": "input_text", "text": output}],
                     });
                     merge_internal(&mut payload, &internal);
-                    response_item(&ts, payload)
+                    write_jsonl(&mut writer, &response_item(&ts, payload))?;
+                    anchor = native_id;
+                    message_count += 1;
                 }
                 // Preserve native records with no cross-agent semantic verbatim.
                 EventKind::NativeRecord { .. } => {
@@ -157,16 +214,6 @@ pub fn import_existing(
                 // we intentionally drop the source model on import.
                 EventKind::ModelChange { .. } => continue,
             };
-            write_jsonl(&mut writer, &line)?;
-            if let Some(id) = line
-                .get("payload")
-                .and_then(|p| p.get("id"))
-                .and_then(Value::as_str)
-            {
-                anchor = id.to_string();
-            }
-            message_count += 1;
-            let _ = ts;
         }
 
         (anchor, message_count)
@@ -186,25 +233,66 @@ pub fn import_existing(
     })
 }
 
-fn session_meta(session_id: &str, cwd: &str, now: &chrono::DateTime<chrono::Utc>) -> Value {
+fn session_meta(
+    session_id: &str,
+    cwd: &str,
+    now: &chrono::DateTime<chrono::Utc>,
+    sessions_root: &Path,
+) -> Value {
     json!({
         "timestamp": now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         "type": "session_meta",
         "payload": {
+            // Codex's deserializer fills session_id from `id` when missing, but
+            // real rollouts always carry both.
+            "session_id": session_id,
             "id": session_id,
             "timestamp": now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             "cwd": cwd,
             "originator": "cash",
             "cli_version": "0.147.0",
             "source": "cli",
+            // Codex persists the session's model provider in the rollout and
+            // restores it on resume; an empty/missing value makes `codex resume`
+            // fail with `Model provider `` not found`. Use the target's default
+            // provider (its config.toml), since Codex has no model-change event.
+            "model_provider": default_model_provider(sessions_root),
+            // We write the legacy layout (response_item + event_msg pairs); make
+            // that explicit so future default changes cannot re-interpret it.
+            "history_mode": "legacy",
         }
     })
+}
+
+/// The model provider Codex would use for a new session: `model_provider` from
+/// `<codex home>/config.toml` (i.e. the parent of the sessions root), falling
+/// back to Codex's built-in default.
+fn default_model_provider(sessions_root: &Path) -> String {
+    if let Some(config_path) = sessions_root.parent().map(|p| p.join("config.toml"))
+        && let Ok(raw) = std::fs::read_to_string(&config_path)
+        && let Ok(value) = raw.parse::<toml::Value>()
+        && let Some(provider) = value.get("model_provider").and_then(toml::Value::as_str)
+        && !provider.is_empty()
+    {
+        return provider.to_string();
+    }
+    "openai".into()
 }
 
 fn response_item(ts: &str, payload: Value) -> Value {
     json!({
         "timestamp": ts,
         "type": "response_item",
+        "payload": payload,
+    })
+}
+
+/// UI event-log record. The resume picker's preview and the transcript are
+/// built from `event_msg` records; response items alone are not discoverable.
+fn event_msg(ts: &str, payload: Value) -> Value {
+    json!({
+        "timestamp": ts,
+        "type": "event_msg",
         "payload": payload,
     })
 }
@@ -238,8 +326,14 @@ pub fn has_records_after_anchor(path: &Path, anchor: &str) -> Result<bool, Strin
     for line in raw.lines() {
         let value: Value =
             serde_json::from_str(line).map_err(|e| format!("parse {}: {e}", path.display()))?;
-        let is_record = value.get("type").and_then(Value::as_str) != Some("session_meta");
-        if found && is_record {
+        let t = value.get("type").and_then(Value::as_str);
+        // session_meta is the header; event_msg records are UI-log duplicates
+        // without a payload id and are never anchors, so they do not count as
+        // content appended after the anchor.
+        if t == Some("session_meta") || t == Some("event_msg") {
+            continue;
+        }
+        if found {
             return Ok(true);
         }
         let id = value

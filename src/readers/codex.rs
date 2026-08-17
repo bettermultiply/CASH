@@ -40,7 +40,7 @@ pub fn read(path: &Path) -> Result<Trace, String> {
             .get("payload")
             .and_then(|p| p.get("id"))
             .and_then(Value::as_str)
-            .map(String::from)
+            .map(strip_synthetic_suffix)
             .unwrap_or_else(|| format!("rec_{i:05}"));
         match t {
             "session_meta" => {
@@ -189,6 +189,21 @@ pub fn read(path: &Path) -> Result<Trace, String> {
     }
     finish_meta(&mut meta, &events);
     Ok(Trace { meta, events })
+}
+
+/// Several IR events derived from one native record share `original_id`; the
+/// Codex importer gives each written response_item a unique id by appending a
+/// deterministic `~N` suffix to later siblings. Strip it to restore the source
+/// original_id so codex -> codex round trips stay event-identical.
+fn strip_synthetic_suffix(id: &str) -> String {
+    match id.rfind('~') {
+        Some(split)
+            if split + 1 < id.len() && id[split + 1..].bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            id[..split].to_string()
+        }
+        _ => id.to_string(),
+    }
 }
 
 /// Native-only metadata of a Codex response_item: the turn linkage and any

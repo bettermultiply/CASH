@@ -265,19 +265,40 @@ fn codex_import_produces_resumable_rollout() {
     let result = import::codex::import(&trace, &dir).expect("import codex");
     let lines = load_jsonl(std::path::Path::new(&result.file));
     assert_eq!(lines[0]["type"], "session_meta");
-    assert!(lines[0]["payload"]["id"].as_str().is_some());
+    assert_eq!(lines[0]["payload"]["id"], lines[0]["payload"]["session_id"]);
+    assert_eq!(lines[0]["payload"]["history_mode"], "legacy");
+    // Codex restores the session provider on resume; an empty value breaks
+    // `codex resume` (`Model provider `` not found`), so the import must record
+    // the target's default provider (here: no config.toml, so "openai").
+    assert_eq!(lines[0]["payload"]["model_provider"], "openai");
 
     let mut counts = std::collections::HashMap::new();
+    let mut event_msg_types = std::collections::HashMap::new();
+    let mut response_ids = std::collections::HashSet::new();
     for line in &lines[1..] {
-        assert_eq!(line["type"], "response_item");
-        let ptype = line["payload"]["type"].as_str().unwrap();
-        *counts.entry(ptype.to_string()).or_insert(0usize) += 1;
+        let t = line["type"].as_str().unwrap();
+        let ptype = line["payload"]["type"].as_str().unwrap_or("");
+        if t == "response_item" {
+            let id = line["payload"]["id"].as_str().unwrap();
+            assert!(
+                response_ids.insert(id.to_string()),
+                "duplicate response_item id {id}"
+            );
+            *counts.entry(ptype.to_string()).or_insert(0usize) += 1;
+        } else {
+            assert_eq!(t, "event_msg", "unexpected record type {t}");
+            *event_msg_types.entry(ptype.to_string()).or_insert(0usize) += 1;
+        }
     }
     assert!(counts.contains_key("message"));
     assert!(counts.contains_key("function_call"));
     assert!(counts.contains_key("function_call_output"));
     // Codex has no model-change event; default-model policy drops it.
     assert!(!counts.contains_key("model_change"));
+    // Codex's resume picker and transcript discover user/assistant turns from
+    // event_msg records; without them the imported session is invisible.
+    assert!(event_msg_types.contains_key("user_message"));
+    assert!(event_msg_types.contains_key("agent_message"));
 
     // every function call links to an output via call_id
     let calls: Vec<_> = lines[1..]
@@ -293,6 +314,17 @@ fn codex_import_produces_resumable_rollout() {
                 .starts_with("call_")
         );
     }
+
+    // The written file must not look like it continued past its own anchor:
+    // sibling events (reasoning + message sharing one original_id) get unique
+    // ids, so re-imports reuse the target without `--force`.
+    assert!(
+        !import::codex::has_records_after_anchor(
+            std::path::Path::new(&result.file),
+            &result.anchor_message_id
+        )
+        .expect("anchor check")
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
