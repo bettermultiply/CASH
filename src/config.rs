@@ -18,23 +18,7 @@ pub fn default_seed_dir() -> PathBuf {
         return expand_home(seed_dir);
     }
 
-    // Read-only compatibility for mappings created before the CASH rename.
-    if let Some(path) = env_path("MIGRATE_SEED_DIR") {
-        return path;
-    }
-    if let Some(cfg) = read_config("MIGRATE_CONFIG", ".config/migrate/config.json")
-        && let Some(seed_dir) = cfg.seed_dir
-    {
-        return expand_home(seed_dir);
-    }
-
-    let cash = home_dir().join(".local/share/cash/seeds");
-    let legacy = home_dir().join(".local/share/migrate/seeds");
-    if !cash.exists() && legacy.exists() {
-        legacy
-    } else {
-        cash
-    }
+    home_dir().join(".local/share/cash/seeds")
 }
 
 pub fn default_seed_output(agent: &str, session_id: &str) -> PathBuf {

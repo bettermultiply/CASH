@@ -12,7 +12,7 @@ CASH 把这两类信息分开：
 
 - **工作区**：仍然是文件与运行状态的唯一事实来源，不需要迁移。
 - **Session 历史**：被 CASH 规范化成统一的事件流，再按目标 agent 的原生格式写入。
-- **映射**：同一个逻辑 session 在各 agent 中的副本关系由 CASH 自己维护。
+- **副本组**：同一个逻辑 session 在各 agent 中的对等副本关系由 CASH 自己维护。
 
 可移植 seed 是结构化事件流，而不是纯 Markdown transcript。
 
@@ -71,7 +71,7 @@ cargo run -- convert \
 ```text
 seed.json       完整可移植 IR
 seed.md         可读 transcript
-manifest.json   源指纹与目标绑定
+manifest.json   源指纹与对等副本组（nodes）
 ```
 
 ### 幂等更新
@@ -101,10 +101,10 @@ cargo run -- convert opencode <SESSION_ID> pi --force
 
 ### 目标 Agent 继续运行后同步回源 Session
 
-第一次转换会在 seed 的 `manifest.json` 中记录源 session 与目标 session 的绑定。目标 Agent 中继续运行后，直接使用**原始 source session ID** 执行：
+第一次转换会在 seed 的 `manifest.json` 中记录一个**对等副本组**：同一个逻辑 session 在多个 agent 中的全部拷贝（`nodes` 数组），组内节点地位完全对等。目标 Agent 中继续运行后，直接使用**任一 session ID**（组内任意副本都行）执行：
 
 ```bash
-cargo run -- sync <SOURCE_SESSION_ID>
+cargo run -- sync <SESSION_ID>
 ```
 
 例如 Pi 转 Codex 后，把 Codex 新增内容同步回原 Pi session：
@@ -113,17 +113,26 @@ cargo run -- sync <SOURCE_SESSION_ID>
 cargo run -- sync 01a00e3b-4852-7083-aa79-7631de474429
 ```
 
-CASH 会在 `opencode`、`pi`、`codex` seed 目录中定位对应 source session，不需要传完整路径。自定义 seed 目录或旧版映射仍可显式使用 `--seed`。
+CASH 会在 seed 目录树中定位包含该 session 的 seed，不需要传完整路径。自定义 seed 目录或旧版映射仍可显式使用 `--seed`。
 
-`sync` 只读取目标锚点之后的新事件并追加回**原始 source session**，不会创建第二个 source session。成功后会更新同步锚点，因此重复运行不会重复插入记录。Codex 自动注入的 developer、权限和环境上下文不会作为用户消息回写。
-
-同步前会校验 source session 自上次转换或同步后未被独立修改；检测到双方都有新增内容时默认停止。确认需要追加时可传 `--force`：
+**对等副本组**：组内节点无顺序、无层级，任意副本之间都是对等关系。向组内加副本会复用同一个 seed——例如先 `convert pi <SID> opencode` 再 `convert opencode <OC_SID> codex`（第二个命令不传 `--seed` 会自动找到已有的 seed），得到 `pi / opencode / codex` 三个对等副本。之后**任意一条副本**续写，`sync` 都会把增量传播到组内其余所有副本：
 
 ```bash
-cargo run -- sync <SOURCE_SESSION_ID> --force
+cargo run -- sync <任意一个副本的 session ID>
 ```
 
-当前支持 OpenCode、Pi 和 Codex 之间的线性“转换到目标、在目标继续、同步回源”流程；两边同时继续后的自动三方合并仍未实现。
+`sync` 只传播单条副本锚点之后的新事件，不会创建第二个 session。成功后会推进所有副本的同步锚点，因此重复运行不会重复插入记录。Codex 自动注入的 developer、权限和环境上下文不会作为用户消息回写。
+
+**冲突即停止**：同步前会校验所有未变更副本自上次同步后未被独立修改。若**多条副本同时**新增了内容，`sync` 默认停止并报冲突，不会强行合并（`--force` 也无法合并发散副本）；三方合并语义仍在设计中。
+
+### 向副本组添加副本
+
+源已是某个 seed 组内成员时，不传 `--seed` 的 `convert` 会复用该 seed 的副本组而不是新建：
+
+```bash
+cargo run -- convert pi <PI_SESSION_ID> opencode
+cargo run -- convert opencode <OC_SESSION_ID> codex   # 复用同一个 seed，追加 codex 副本
+```
 
 ## 种子目录配置
 
@@ -132,8 +141,6 @@ cargo run -- sync <SOURCE_SESSION_ID> --force
 1. `CASH_SEED_DIR`
 2. `CASH_CONFIG` 或 `~/.config/cash/config.json`
 3. `~/.local/share/cash/seeds`
-
-旧版本的 `MIGRATE_SEED_DIR`、`~/.config/migrate/config.json`、`~/.local/share/migrate/seeds` 会被只读兼容读取，避免已有映射失效。
 
 ```bash
 export CASH_SEED_DIR=~/agent-seeds
@@ -236,12 +243,12 @@ cargo run --bin make_fixtures -- --out tests/fixtures/real
 ## 未来方向
 
 - **执行环境打包**：当前只迁移 session 历史，工作区/依赖/运行状态依赖磁盘。未来支持把执行环境整体打包（如 `tar.zst`），让一个"作业"可以 import 到其他执行环境运行，而不是只在当前机器上接力。
-- **双向增量合并**：OpenCode、Pi、Codex 之间的线性回写已支持；两个副本同时新增内容时的分支/合并语义仍在设计中。
+- **三方合并**：副本组内多副本的线性传播已支持；多副本同时新增内容时的分支/合并语义仍在设计中。
 - **模型能力检测**：根据各 agent 支持的模型做自动映射与提示。
 
 ## 当前限制
 
 - 跨 agent 时，不同目标可表示的事件子集不同，请查看 `manifest.json` 的 `dropped_event_count`。
 - 锚点之后继续过的目标 session 需要显式 `--force` 才能被替换。
-- `sync` 支持目标 Agent 增量回写源 session；两副本同时新增后的自动合并仍在设计中。
+- `sync` 只传播单条变更副本的增量到其他副本；多条副本同时新增时冲突即停止，三方合并仍在设计中。
 - 自动模型能力检测 / 模型映射表仍在设计中。

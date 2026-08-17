@@ -6,7 +6,31 @@ use serde::{Deserialize, Serialize};
 use crate::ir::{Event, EventKind, Trace};
 use crate::util::sha256_hex;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// 一个对等副本节点：同一个逻辑 session 在某个 agent 中的一份拷贝。
+/// 组内所有节点地位完全相同，没有顺序或层级语义。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NodeRef {
+    pub agent: String,
+    pub session_id: String,
+    pub file: String,
+    /// 上次转换/同步时该副本的最后一条事件 id，用于计算增量与检测续写。
+    pub anchor_message_id: String,
+    /// 该副本在锚点处的 events 哈希。
+    pub events_sha256: String,
+    // ---- 导出元数据（seed 注册节点携带） ----
+    pub file_sha256: String,
+    pub event_count: usize,
+    pub exported_at: String,
+    // ---- 导入元数据（convert 生成的副本携带） ----
+    pub injected_at: String,
+    pub seed_event_count: usize,
+    pub native_message_count: usize,
+    pub dropped_event_count: usize,
+}
+
+// Legacy single-source manifest shape, read to migrate into `nodes`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SourceRef {
     pub agent: String,
     pub session_id: String,
@@ -15,27 +39,26 @@ pub struct SourceRef {
     pub events_sha256: String,
     pub event_count: usize,
     pub exported_at: String,
+    #[serde(default)]
+    pub anchor_message_id: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// Legacy single-target manifest shape, read to migrate into `nodes`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TargetRef {
     pub agent: String,
     pub session_id: String,
-    #[serde(default)]
     pub file: String,
-    /// Anchor message id: the last message injected by the importer, used to
-    /// detect whether the target agent continued past the seed point.
     pub anchor_message_id: String,
     pub injected_at: String,
     pub events_sha256: String,
-    #[serde(default)]
     pub seed_event_count: usize,
-    #[serde(default)]
     pub native_message_count: usize,
-    #[serde(default)]
     pub dropped_event_count: usize,
 }
 
+// Legacy sync bookkeeping, read to migrate older manifests.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SyncRef {
@@ -50,14 +73,81 @@ pub struct SyncRef {
     pub target_events_sha256: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Manifest {
     pub version: u32,
     pub seed_files: Vec<String>,
-    pub source: SourceRef,
+    /// 对等副本组：同一逻辑 session 的全部拷贝，无顺序。`sync` 把单条变更
+    /// 副本的增量广播到组内其余所有副本。
+    pub nodes: Vec<NodeRef>,
+    // 旧格式字段，仅用于读取并迁移进 `nodes`，新 manifest 不再写入。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<SourceRef>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub targets: Vec<TargetRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<TargetRef>,
-    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub sync: Option<SyncRef>,
+}
+
+impl Manifest {
+    /// 组内全部对等副本。
+    pub fn copies(&self) -> Vec<NodeRef> {
+        self.nodes.clone()
+    }
+
+    /// 查找组内与 `agent`/`session_id` 匹配的副本。
+    pub fn find_node(&self, agent: &str, session_id: &str) -> Option<&NodeRef> {
+        self.nodes
+            .iter()
+            .find(|node| node.agent == agent && node.session_id == session_id)
+    }
+
+    /// 更新组内匹配副本的同步锚点与事件哈希。
+    pub fn update_node(&mut self, agent: &str, session_id: &str, anchor: &str, events_sha256: &str) {
+        if let Some(node) = self
+            .nodes
+            .iter_mut()
+            .find(|node| node.agent == agent && node.session_id == session_id)
+        {
+            node.anchor_message_id = anchor.to_string();
+            node.events_sha256 = events_sha256.to_string();
+        }
+    }
+
+    /// 插入或替换组内一个副本（按 agent + session id 匹配）。
+    pub fn upsert_node(&mut self, node: NodeRef) {
+        if let Some(existing) = self
+            .nodes
+            .iter_mut()
+            .find(|n| n.agent == node.agent && n.session_id == node.session_id)
+        {
+            *existing = node;
+        } else {
+            self.nodes.push(node);
+        }
+    }
+}
+
+/// Build the registration copy for a freshly exported trace.
+pub fn node_from_trace(trace: &Trace) -> NodeRef {
+    NodeRef {
+        agent: trace.meta.source.as_str().into(),
+        session_id: trace.meta.session_id.clone(),
+        file: trace.meta.file.clone(),
+        anchor_message_id: trace
+            .events
+            .last()
+            .map(|event| event.original_id.clone())
+            .unwrap_or_default(),
+        events_sha256: trace.meta.events_sha256.clone(),
+        file_sha256: trace.meta.source_file_sha256.clone(),
+        event_count: trace.meta.event_count,
+        exported_at: Utc::now().to_rfc3339(),
+        ..Default::default()
+    }
 }
 
 /// Write seed.json (canonical IR), seed.md (markdown transcript) and
@@ -65,24 +155,34 @@ pub struct Manifest {
 pub fn write_seed(trace: &Trace, out_dir: &Path) -> Result<Manifest, String> {
     std::fs::create_dir_all(out_dir).map_err(|e| format!("mkdir {}: {e}", out_dir.display()))?;
 
-    let existing_manifest = load_manifest(out_dir).ok().filter(|manifest| {
-        manifest.source.agent == trace.meta.source.as_str()
-            && manifest.source.session_id == trace.meta.session_id
-    });
-    let existing_target = existing_manifest
-        .as_ref()
-        .and_then(|manifest| manifest.target.clone());
-    let existing_sync = existing_manifest.and_then(|manifest| {
-        if manifest.source.events_sha256 == trace.meta.events_sha256 {
-            manifest.sync
-        } else {
-            None
-        }
-    });
+    let existing = load_manifest(out_dir).ok();
+    let mut nodes = existing.as_ref().map(|m| m.nodes.clone()).unwrap_or_default();
+    if !nodes
+        .iter()
+        .any(|node| node.agent == trace.meta.source.as_str() && node.session_id == trace.meta.session_id)
+    {
+        nodes.push(node_from_trace(trace));
+    }
 
+    write_trace_files(trace, out_dir)?;
+
+    let manifest = Manifest {
+        version: 1,
+        seed_files: vec!["seed.json".into(), "seed.md".into()],
+        nodes,
+        ..Default::default()
+    };
+    save_manifest(out_dir, &manifest)?;
+
+    Ok(manifest)
+}
+
+/// Write the seed data files (seed.json + seed.md) without touching the
+/// manifest, used when refreshing a seed during a chain-extending convert.
+pub fn write_trace_files(trace: &Trace, out_dir: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(out_dir).map_err(|e| format!("mkdir {}: {e}", out_dir.display()))?;
     let seed_json = out_dir.join("seed.json");
     let seed_md = out_dir.join("seed.md");
-    let manifest_path = out_dir.join("manifest.json");
 
     let json_text = serde_json::to_string_pretty(trace).map_err(|e| e.to_string())?;
     std::fs::write(&seed_json, json_text)
@@ -90,33 +190,63 @@ pub fn write_seed(trace: &Trace, out_dir: &Path) -> Result<Manifest, String> {
 
     let md = to_markdown(trace);
     std::fs::write(&seed_md, md).map_err(|e| format!("write {}: {e}", seed_md.display()))?;
-
-    let manifest = Manifest {
-        version: 1,
-        seed_files: vec!["seed.json".into(), "seed.md".into()],
-        source: SourceRef {
-            agent: trace.meta.source.as_str().into(),
-            session_id: trace.meta.session_id.clone(),
-            file: trace.meta.file.clone(),
-            file_sha256: trace.meta.source_file_sha256.clone(),
-            events_sha256: trace.meta.events_sha256.clone(),
-            event_count: trace.meta.event_count,
-            exported_at: Utc::now().to_rfc3339(),
-        },
-        target: existing_target,
-        sync: existing_sync,
-    };
-    let mjson = serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?;
-    std::fs::write(&manifest_path, mjson)
-        .map_err(|e| format!("write {}: {e}", manifest_path.display()))?;
-
-    Ok(manifest)
+    Ok(())
 }
 
 pub fn load_manifest(out_dir: &Path) -> Result<Manifest, String> {
     let p = out_dir.join("manifest.json");
     let raw = std::fs::read_to_string(&p).map_err(|e| format!("read {}: {e}", p.display()))?;
-    serde_json::from_str(&raw).map_err(|e| format!("parse {}: {e}", p.display()))
+    let mut manifest: Manifest =
+        serde_json::from_str(&raw).map_err(|e| format!("parse {}: {e}", p.display()))?;
+    // Migrate legacy source + target(s) manifests into the peer-node group.
+    if manifest.nodes.is_empty() {
+        if let Some(source) = manifest.source.take() {
+            manifest.nodes.push(NodeRef {
+                agent: source.agent,
+                session_id: source.session_id,
+                file: source.file,
+                anchor_message_id: source.anchor_message_id,
+                events_sha256: source.events_sha256,
+                file_sha256: source.file_sha256,
+                event_count: source.event_count,
+                exported_at: source.exported_at,
+                ..Default::default()
+            });
+        }
+        if manifest.targets.is_empty()
+            && let Some(target) = manifest.target.take()
+        {
+            manifest.targets.push(target);
+        }
+        for target in manifest.targets.drain(..) {
+            manifest.nodes.push(NodeRef {
+                agent: target.agent,
+                session_id: target.session_id,
+                file: target.file,
+                anchor_message_id: target.anchor_message_id,
+                events_sha256: target.events_sha256,
+                injected_at: target.injected_at,
+                seed_event_count: target.seed_event_count,
+                native_message_count: target.native_message_count,
+                dropped_event_count: target.dropped_event_count,
+                ..Default::default()
+            });
+        }
+        if let Some(sync) = manifest.sync.take() {
+            if let Some(node) = manifest.nodes.iter_mut().find(|node| {
+                node.agent == sync.target_agent && node.session_id == sync.target_session_id
+            }) {
+                node.anchor_message_id = sync.target_anchor_message_id;
+                node.events_sha256 = sync.target_events_sha256;
+            }
+            if let Some(node) = manifest.nodes.iter_mut().find(|node| {
+                node.agent == sync.source_agent && node.session_id == sync.source_session_id
+            }) {
+                node.events_sha256 = sync.source_events_sha256;
+            }
+        }
+    }
+    Ok(manifest)
 }
 
 pub fn save_manifest(out_dir: &Path, manifest: &Manifest) -> Result<(), String> {

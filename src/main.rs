@@ -178,7 +178,11 @@ fn run(cli: Cli) -> Result<(), String> {
             });
             let manifest = export::write_seed(&trace, &out)?;
             println!("exported to {}", out.display());
-            println!("  source events_sha256: {}", manifest.source.events_sha256);
+            let events_sha256 = manifest
+                .find_node(kind.as_str(), &trace.meta.session_id)
+                .map(|node| node.events_sha256.clone())
+                .unwrap_or_default();
+            println!("  source events_sha256: {events_sha256}");
             Ok(())
         }
         Command::Import {
@@ -195,7 +199,7 @@ fn run(cli: Cli) -> Result<(), String> {
             let db = opencode_db.unwrap_or_else(default_opencode_db);
             let trace = load_trace(&seed)?;
             warn_model_override(&trace, model.as_deref());
-            let result = import_and_update_manifest(
+            let (result, _) = import_and_update_manifest(
                 kind,
                 &trace,
                 &seed,
@@ -237,15 +241,44 @@ fn run(cli: Cli) -> Result<(), String> {
                 trace.meta.event_count,
                 &trace.meta.source_file_sha256
             );
-            let seed = seed.unwrap_or_else(|| {
-                config::default_seed_output(source_kind.as_str(), &trace.meta.session_id)
-            });
-            let manifest = export::write_seed(&trace, &seed)?;
-            println!("exported seed to {}", seed.display());
-            println!("  source events_sha256: {}", manifest.source.events_sha256);
+            // Group-aware: a seed is a peer group of copies of one logical
+            // session. When the convert source is already a member of an
+            // existing seed (e.g. pi -> opencode, then opencode -> codex), we
+            // reuse that group and just add the new copy.
+            let seed = match seed {
+                Some(explicit) => explicit,
+                None => {
+                    match find_seed_containing_node(source_kind.as_str(), &trace.meta.session_id)? {
+                        Some(found) => found,
+                        None => config::default_seed_output(
+                            source_kind.as_str(),
+                            &trace.meta.session_id,
+                        ),
+                    }
+                }
+            };
+            if seed.join("manifest.json").exists() {
+                let existing = export::load_manifest(&seed)?;
+                if !existing.nodes.iter().any(|node| {
+                    node.agent == source_agent && node.session_id == trace.meta.session_id
+                }) {
+                    return Err(format!(
+                        "seed {} already tracks a different session; pass a fresh --seed directory",
+                        seed.display()
+                    ));
+                }
+                export::write_trace_files(&trace, &seed)?;
+            } else {
+                let manifest = export::write_seed(&trace, &seed)?;
+                println!("exported seed to {}", seed.display());
+                if let Some(node) = manifest.find_node(source_kind.as_str(), &trace.meta.session_id)
+                {
+                    println!("  source events_sha256: {}", node.events_sha256);
+                }
+            }
 
             warn_model_override(&trace, model.as_deref());
-            let result = import_and_update_manifest(
+            let (result, mut manifest) = import_and_update_manifest(
                 target_kind,
                 &trace,
                 &seed,
@@ -257,6 +290,20 @@ fn run(cli: Cli) -> Result<(), String> {
                     model_override: model,
                 },
             )?;
+            // Advance the converted copy's sync anchor past this trace so a
+            // later `sync` does not re-propagate already-converted events.
+            let last_id = trace
+                .events
+                .last()
+                .map(|event| event.original_id.clone())
+                .unwrap_or_default();
+            manifest.update_node(
+                &source_agent,
+                &trace.meta.session_id,
+                &last_id,
+                &trace.meta.events_sha256,
+            );
+            export::save_manifest(&seed, &manifest)?;
             print_import_result(target_kind, &seed, &result);
             Ok(())
         }
@@ -283,33 +330,20 @@ fn run(cli: Cli) -> Result<(), String> {
             let db = opencode_db.unwrap_or_else(default_opencode_db);
             let manifest = export::load_manifest(&seed)?;
             let report = sync::check(&manifest, &db)?;
-            println!("SOURCE  {}", report.source.detail);
-            println!(
-                "  file hash unchanged: {}",
-                yesno(report.source.file_unchanged)
-            );
-            println!(
-                "  events unchanged:    {}",
-                yesno(report.source.events_unchanged)
-            );
-            println!("TARGET  {}", report.target.detail);
-            println!(
-                "  session present:     {}",
-                yesno(report.target.session_present)
-            );
-            println!(
-                "  anchor present:      {}",
-                yesno(report.target.anchor_present)
-            );
-            println!(
-                "  continued past seed: {}",
-                yesno(report.target.continued_past_seed)
-            );
-            if report.target.extra_messages > 0 {
-                println!(
-                    "  extra messages after seed point: {}",
-                    report.target.extra_messages
-                );
+            for node in report.nodes {
+                println!("NODE {} ({})", node.agent, node.session_id);
+                println!("  detail: {}", node.detail);
+                println!("  session present: {}", yesno(node.session_present));
+                println!("  anchor present: {}", yesno(node.anchor_present));
+                println!("  continued past seed: {}", yesno(node.continued_past_seed));
+                if node.extra_messages > 0 {
+                    println!(
+                        "  extra messages after seed point: {}",
+                        node.extra_messages
+                    );
+                }
+                println!("  file hash unchanged: {}", yesno(node.file_unchanged));
+                println!("  events unchanged: {}", yesno(node.events_unchanged));
             }
             Ok(())
         }
@@ -321,87 +355,156 @@ fn sync_continuation(
     pi_root: &Path,
     codex_root: &Path,
     opencode_db: &Path,
-    force: bool,
+    _force: bool,
 ) -> Result<(), String> {
     let mut manifest = export::load_manifest(seed)?;
-    let source_kind: AgentKind = manifest.source.agent.parse()?;
-    let target = manifest
-        .target
-        .clone()
-        .ok_or_else(|| "seed has no target session; run convert first".to_string())?;
-    let target_kind: AgentKind = target.agent.parse()?;
-    let target_trace = read_bound_trace(target_kind, &target, pi_root, codex_root, opencode_db)?;
-    let sync = manifest.sync.as_ref().filter(|sync| {
-        sync.source_agent == manifest.source.agent
-            && sync.source_session_id == manifest.source.session_id
-            && sync.target_agent == target.agent
-            && sync.target_session_id == target.session_id
-    });
-    let anchor = sync
-        .map(|sync| sync.target_anchor_message_id.as_str())
-        .unwrap_or(target.anchor_message_id.as_str());
-    let anchor_index = target_trace
-        .events
-        .iter()
-        .rposition(|event| anchor_matches(target_kind, &event.original_id, anchor))
-        .ok_or_else(|| format!("target sync anchor {anchor} is missing"))?;
-    let all_delta = &target_trace.events[anchor_index + 1..];
-    if all_delta.is_empty() {
-        println!("no new events after {} anchor", target_kind);
+    let nodes = manifest.copies();
+    if nodes.len() < 2 {
+        println!("seed has no target copies; run convert first");
         return Ok(());
     }
 
-    let source_trace = read_source_trace(source_kind, &manifest.source, opencode_db)?;
-    let expected_hash = sync
-        .map(|sync| sync.source_events_sha256.as_str())
-        .unwrap_or(manifest.source.events_sha256.as_str());
-    if source_trace.meta.events_sha256 != expected_hash && !force {
+    // Read every copy's current trace and compute its delta past its anchor.
+    let mut traces: Vec<ir::Trace> = Vec::with_capacity(nodes.len());
+    for node in &nodes {
+        traces.push(read_node_trace(node, pi_root, codex_root, opencode_db)?);
+    }
+    struct CopyState {
+        delta: Vec<ir::Event>,
+        has_unconsumed: bool,
+    }
+    let states: Vec<CopyState> = nodes
+        .iter()
+        .zip(&traces)
+        .map(|(node, trace)| {
+            let kind: AgentKind = node.agent.parse().unwrap();
+            match trace
+                .events
+                .iter()
+                .rposition(|event| anchor_matches(kind, &event.original_id, &node.anchor_message_id))
+            {
+                Some(index) => CopyState {
+                    delta: trace.events[index + 1..]
+                        .iter()
+                        .filter(|event| is_syncable_event(kind, event))
+                        .cloned()
+                        .collect(),
+                    has_unconsumed: index + 1 < trace.events.len(),
+                },
+                None => CopyState {
+                    delta: Vec::new(),
+                    has_unconsumed: false,
+                },
+            }
+        })
+        .collect();
+
+    let changed: Vec<usize> = states
+        .iter()
+        .enumerate()
+        .filter(|(_, state)| !state.delta.is_empty())
+        .map(|(i, _)| i)
+        .collect();
+
+    if changed.is_empty() {
+        // Copies may still have gained events that are not transferable (e.g.
+        // Codex-injected context); advance their anchors so we do not rescan.
+        let mut advanced = false;
+        for (i, node) in nodes.iter().enumerate() {
+            if states[i].has_unconsumed {
+                let last_id = traces[i]
+                    .events
+                    .last()
+                    .map(|event| event.original_id.clone())
+                    .unwrap_or_default();
+                manifest.update_node(
+                    &node.agent,
+                    &node.session_id,
+                    &last_id,
+                    &traces[i].meta.events_sha256,
+                );
+                advanced = true;
+            }
+        }
+        if advanced {
+            export::save_manifest(seed, &manifest)?;
+            println!("no transferable events after {} copy anchors", nodes.len());
+        } else {
+            println!("no new events after {} copy anchors", nodes.len());
+        }
+        return Ok(());
+    }
+
+    // Linear writeback + stop on conflict: only a single changed copy is
+    // propagated. If several copies gained events independently we refuse;
+    // --force cannot merge divergent copies.
+    if changed.len() > 1 {
+        let names: Vec<&str> = changed.iter().map(|&i| nodes[i].agent.as_str()).collect();
         return Err(format!(
-            "original {} session changed since last sync; refusing to append {} (use --force)",
-            source_kind, manifest.source.session_id
+            "conflict: multiple copies gained new events ({}); refusing to merge — resolve the divergence manually",
+            names.join(", ")
         ));
     }
-
-    let delta: Vec<ir::Event> = all_delta
-        .iter()
-        .filter(|event| is_syncable_event(target_kind, event))
-        .cloned()
-        .collect();
+    let changed_index = changed[0];
+    let delta = states[changed_index].delta.clone();
     if delta.is_empty() {
-        save_sync_ref(&mut manifest, &target, &source_trace, &target_trace);
-        export::save_manifest(seed, &manifest)?;
-        println!("no transferable events after {} anchor", target_kind);
         return Ok(());
     }
-    let delta_trace = ir::Trace {
-        meta: target_trace.meta.clone(),
-        events: delta.clone(),
-    };
-    let result = match source_kind {
-        AgentKind::OpenCode => import::opencode::append_existing(
-            &delta_trace,
-            opencode_db,
-            &manifest.source.session_id,
-        )?,
-        AgentKind::Pi | AgentKind::Codex => rewrite_source_with_delta(
-            source_kind,
-            &source_trace,
-            &delta,
-            Path::new(&manifest.source.file),
-            pi_root,
-            codex_root,
-        )?,
-    };
-    let updated_source = read_source_trace(source_kind, &manifest.source, opencode_db)?;
-    save_sync_ref(&mut manifest, &target, &updated_source, &target_trace);
+
+    // Every other copy must be untouched since the last sync; otherwise we
+    // would clobber independent work.
+    for i in 0..nodes.len() {
+        if i == changed_index {
+            continue;
+        }
+        if traces[i].meta.events_sha256 != nodes[i].events_sha256 {
+            return Err(format!(
+                "{} copy {} changed independently since the last sync; refusing to propagate (resolve the divergence first)",
+                nodes[i].agent, nodes[i].session_id
+            ));
+        }
+    }
+
+    for i in 0..nodes.len() {
+        if i == changed_index {
+            continue;
+        }
+        let kind: AgentKind = nodes[i].agent.parse()?;
+        append_to_node(kind, &nodes[i], &traces[i], &delta, pi_root, codex_root, opencode_db)?;
+        let updated = read_node_trace(&nodes[i], pi_root, codex_root, opencode_db)?;
+        let last_id = updated
+            .events
+            .last()
+            .map(|event| event.original_id.clone())
+            .unwrap_or_default();
+        manifest.update_node(
+            &nodes[i].agent,
+            &nodes[i].session_id,
+            &last_id,
+            &updated.meta.events_sha256,
+        );
+    }
+    // The changed copy's anchor also advances past its own delta (already
+    // propagated to every other copy), so a later sync does not re-propagate
+    // consumed events.
+    let changed_node = &nodes[changed_index];
+    let last_id = traces[changed_index]
+        .events
+        .last()
+        .map(|event| event.original_id.clone())
+        .unwrap_or_default();
+    manifest.update_node(
+        &changed_node.agent,
+        &changed_node.session_id,
+        &last_id,
+        &traces[changed_index].meta.events_sha256,
+    );
     export::save_manifest(seed, &manifest)?;
     println!(
-        "synced {} {} events into {} session {} ({} records)",
+        "synced {} {} events into the other {} copies",
         delta.len(),
-        target_kind,
-        source_kind,
-        manifest.source.session_id,
-        result.message_count
+        nodes[changed_index].agent,
+        nodes.len() - 1
     );
     println!("manifest updated: {}", seed.join("manifest.json").display());
     Ok(())
@@ -444,97 +547,51 @@ fn is_injected_codex_context(text: &str) -> bool {
     .any(|prefix| text.starts_with(prefix))
 }
 
-fn save_sync_ref(
-    manifest: &mut export::Manifest,
-    target: &export::TargetRef,
-    source_trace: &ir::Trace,
-    target_trace: &ir::Trace,
-) {
-    let last_target_event = target_trace.events.last().expect("target has anchor");
-    manifest.sync = Some(export::SyncRef {
-        source_agent: manifest.source.agent.clone(),
-        source_session_id: manifest.source.session_id.clone(),
-        source_file: manifest.source.file.clone(),
-        source_events_sha256: source_trace.meta.events_sha256.clone(),
-        target_agent: target.agent.clone(),
-        target_session_id: target.session_id.clone(),
-        target_file: target.file.clone(),
-        target_anchor_message_id: last_target_event.original_id.clone(),
-        target_events_sha256: target_trace.meta.events_sha256.clone(),
-    });
-}
-
-fn read_bound_trace(
-    kind: AgentKind,
-    target: &export::TargetRef,
+fn read_node_trace(
+    node: &export::NodeRef,
     pi_root: &Path,
     codex_root: &Path,
     opencode_db: &Path,
 ) -> Result<ir::Trace, String> {
+    let kind: AgentKind = node.agent.parse()?;
     match kind {
-        AgentKind::OpenCode => readers::opencode::read(opencode_db, &target.session_id),
-        AgentKind::Pi | AgentKind::Codex => {
-            let root = if kind == AgentKind::Pi {
-                pi_root
-            } else {
-                codex_root
-            };
-            let path = resolve_bound_file(&target.file, root);
-            let trace =
-                readers::read_trace(kind, path.to_string_lossy().as_ref(), root, opencode_db)?;
-            if trace.meta.session_id != target.session_id {
-                return Err(format!(
-                    "target {} session ID mismatch: manifest={}, file={}",
-                    kind, target.session_id, trace.meta.session_id
-                ));
-            }
-            Ok(trace)
-        }
+        AgentKind::OpenCode => readers::opencode::read(opencode_db, &node.session_id),
+        AgentKind::Pi => readers::pi::read(&resolve_bound_file(&node.file, pi_root)),
+        AgentKind::Codex => readers::codex::read(&resolve_bound_file(&node.file, codex_root)),
     }
 }
 
-fn read_source_trace(
+/// Append `delta` into one copy of the logical session, preserving its native
+/// session identity.
+fn append_to_node(
     kind: AgentKind,
-    source: &export::SourceRef,
-    opencode_db: &Path,
-) -> Result<ir::Trace, String> {
-    match kind {
-        AgentKind::OpenCode => readers::opencode::read(opencode_db, &source.session_id),
-        AgentKind::Pi => readers::pi::read(Path::new(&source.file)),
-        AgentKind::Codex => readers::codex::read(Path::new(&source.file)),
-    }
-}
-
-fn rewrite_source_with_delta(
-    kind: AgentKind,
-    source_trace: &ir::Trace,
+    node: &export::NodeRef,
+    trace: &ir::Trace,
     delta: &[ir::Event],
-    source_file: &Path,
     pi_root: &Path,
     codex_root: &Path,
+    opencode_db: &Path,
 ) -> Result<import::ImportResult, String> {
-    let mut trace = source_trace.clone();
-    trace.events.extend_from_slice(delta);
     match kind {
-        AgentKind::Pi => import::pi::import_existing(
-            &trace,
-            pi_root,
-            Some(source_file),
-            Some(&source_trace.meta.session_id),
-            None,
-            true,
-            None,
-        ),
-        AgentKind::Codex => import::codex::import_existing(
-            &trace,
-            codex_root,
-            Some(source_file),
-            Some(&source_trace.meta.session_id),
-            None,
-            true,
-            None,
-        ),
-        AgentKind::OpenCode => unreachable!(),
+        AgentKind::OpenCode => {
+            let delta_trace = ir::Trace {
+                meta: trace.meta.clone(),
+                events: delta.to_vec(),
+            };
+            import::opencode::append_existing(&delta_trace, opencode_db, &node.session_id)
+        }
+        AgentKind::Pi => {
+            let mut merged = trace.clone();
+            merged.events.extend_from_slice(delta);
+            let file = resolve_bound_file(&node.file, pi_root);
+            import::pi::import_existing(&merged, pi_root, Some(&file), Some(&node.session_id), None, true, None)
+        }
+        AgentKind::Codex => {
+            let mut merged = trace.clone();
+            merged.events.extend_from_slice(delta);
+            let file = resolve_bound_file(&node.file, codex_root);
+            import::codex::import_existing(&merged, codex_root, Some(&file), Some(&node.session_id), None, true, None)
+        }
     }
 }
 
@@ -580,54 +637,52 @@ fn import_and_update_manifest(
     trace: &ir::Trace,
     seed: &Path,
     opts: ImportOptions,
-) -> Result<import::ImportResult, String> {
+) -> Result<(import::ImportResult, export::Manifest), String> {
     let mut manifest = export::load_manifest(seed)?;
-    let existing = manifest
-        .target
-        .as_ref()
-        .filter(|target| target.agent == kind.as_str());
+    let existing = manifest.nodes.iter().find(|node| node.agent == kind.as_str());
     let model_override = opts.model_override.as_deref();
     let result = match kind {
         AgentKind::OpenCode => import::opencode::import_existing(
             trace,
             &opts.opencode_db,
-            existing.map(|target| target.session_id.as_str()),
-            existing.map(|target| target.anchor_message_id.as_str()),
+            existing.map(|node| node.session_id.as_str()),
+            existing.map(|node| node.anchor_message_id.as_str()),
             opts.force,
             model_override,
         )?,
         AgentKind::Pi => import::pi::import_existing(
             trace,
             &opts.pi_root,
-            existing.map(|target| Path::new(&target.file)),
-            existing.map(|target| target.session_id.as_str()),
-            existing.map(|target| target.anchor_message_id.as_str()),
+            existing.map(|node| Path::new(&node.file)),
+            existing.map(|node| node.session_id.as_str()),
+            existing.map(|node| node.anchor_message_id.as_str()),
             opts.force,
             model_override,
         )?,
         AgentKind::Codex => import::codex::import_existing(
             trace,
             &opts.codex_root,
-            existing.map(|target| Path::new(&target.file)),
-            existing.map(|target| target.session_id.as_str()),
-            existing.map(|target| target.anchor_message_id.as_str()),
+            existing.map(|node| Path::new(&node.file)),
+            existing.map(|node| node.session_id.as_str()),
+            existing.map(|node| node.anchor_message_id.as_str()),
             opts.force,
             model_override,
         )?,
     };
-    manifest.target = Some(export::TargetRef {
+    manifest.upsert_node(export::NodeRef {
         agent: kind.as_str().into(),
         session_id: result.session_id.clone(),
         file: result.file.clone(),
         anchor_message_id: result.anchor_message_id.clone(),
-        injected_at: chrono::Utc::now().to_rfc3339(),
         events_sha256: export::hash_trace_events(&trace.events),
+        injected_at: chrono::Utc::now().to_rfc3339(),
         seed_event_count: trace.events.len(),
         native_message_count: result.message_count,
         dropped_event_count: result.dropped_event_count,
+        ..Default::default()
     });
     export::save_manifest(seed, &manifest)?;
-    Ok(result)
+    Ok((result, manifest))
 }
 
 fn warn_model_override(trace: &ir::Trace, model_override: Option<&str>) {
@@ -675,32 +730,82 @@ fn print_import_result(kind: AgentKind, seed: &Path, result: &import::ImportResu
 
 fn resolve_sync_seed(session: Option<String>, seed: Option<PathBuf>) -> Result<PathBuf, String> {
     match (session, seed) {
-        (Some(_), Some(_)) => Err("pass either a source session ID or --seed, not both".into()),
+        (Some(_), Some(_)) => Err("pass either a session ID or --seed, not both".into()),
         (Some(session_id), None) => {
-            let mut matches = Vec::new();
-            for kind in [AgentKind::OpenCode, AgentKind::Pi, AgentKind::Codex] {
-                let candidate = config::default_seed_output(kind.as_str(), &session_id);
-                let Ok(manifest) = export::load_manifest(&candidate) else {
-                    continue;
-                };
-                if manifest.source.agent == kind.as_str()
-                    && manifest.source.session_id == session_id
-                {
-                    matches.push(candidate);
-                }
-            }
+            let matches = find_seed_containing_session(&session_id)?;
             match matches.len() {
-                1 => Ok(matches.remove(0)),
+                1 => Ok(matches.into_iter().next().expect("one match")),
                 0 => Err(format!(
-                    "no seed found for source session {session_id} under {}",
+                    "no seed found for session {session_id} under {}",
                     config::default_seed_dir().display()
                 )),
                 _ => Err(format!(
-                    "source session ID {session_id} has multiple seeds; use --seed to choose one"
+                    "session {session_id} has multiple seeds; use --seed to choose one"
                 )),
             }
         }
         (None, seed) => resolve_seed_dir(seed),
+    }
+}
+
+/// Find the seed whose peer group contains a copy for `agent`/`session`.
+/// Used by `convert` so a chain (e.g. pi -> opencode, then opencode -> codex)
+/// extends the same group instead of starting a new seed.
+fn find_seed_containing_node(agent: &str, session: &str) -> Result<Option<PathBuf>, String> {
+    let matches = find_seed_containing(|manifest| {
+        manifest
+            .copies()
+            .iter()
+            .any(|node| node.agent == agent && node.session_id == session)
+    })?;
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(Some(matches.into_iter().next().expect("one match"))),
+        _ => Err(format!(
+            "source {agent} session {session} matches multiple seeds; pass --seed to choose one"
+        )),
+    }
+}
+
+fn find_seed_containing_session(session: &str) -> Result<Vec<PathBuf>, String> {
+    find_seed_containing(|manifest| {
+        manifest
+            .copies()
+            .iter()
+            .any(|node| node.session_id == session)
+    })
+}
+
+fn find_seed_containing(
+    matches_node: impl Fn(&export::Manifest) -> bool,
+) -> Result<Vec<PathBuf>, String> {
+    let mut dirs = Vec::new();
+    collect_seed_dirs(&config::default_seed_dir(), &mut dirs);
+    let mut found = Vec::new();
+    for dir in dirs {
+        if let Ok(manifest) = export::load_manifest(&dir)
+            && matches_node(&manifest)
+        {
+            found.push(dir);
+        }
+    }
+    Ok(found)
+}
+
+fn collect_seed_dirs(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if path.join("manifest.json").exists() && path.join("seed.json").exists() {
+            out.push(path.clone());
+        } else {
+            collect_seed_dirs(&path, out);
+        }
     }
 }
 

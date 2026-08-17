@@ -65,7 +65,6 @@ fn opencode_cli_can_list_and_export_imported_session() {
 #[ignore = "requires pi CLI; starts native CLI export against a temp session root"]
 fn pi_cli_can_export_imported_session() {
     let pi_bin = std::env::var("CASH_PI_BIN")
-        .or_else(|_| std::env::var("MIGRATE_PI_BIN"))
         .unwrap_or_else(|_| "/home/betmul/.local/bin/pi".into());
     if !Path::new(&pi_bin).exists() {
         eprintln!("pi CLI not found at {pi_bin}; skipping native startup test");
@@ -104,7 +103,6 @@ fn pi_cli_can_export_imported_session() {
 #[ignore = "requires pi CLI and a PTY; starts the imported session without making a model request"]
 fn pi_tui_starts_imported_session_without_uncaught_exception() {
     let pi_bin = std::env::var("CASH_PI_BIN")
-        .or_else(|_| std::env::var("MIGRATE_PI_BIN"))
         .unwrap_or_else(|_| "/home/betmul/.local/bin/pi".into());
     if !Path::new(&pi_bin).exists() {
         eprintln!("pi CLI not found at {pi_bin}; skipping native startup test");

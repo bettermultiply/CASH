@@ -19,27 +19,23 @@ fn main() -> Result<(), String> {
     let codex_root = home.join(".codex/sessions");
     let opencode_db = home.join(".local/share/opencode/opencode.db");
 
-    let pi_path =
-        env_path("CASH_FIXTURE_PI_SESSION", "MIGRATE_FIXTURE_PI_SESSION").unwrap_or_else(|| {
+    let pi_path = env_value("CASH_FIXTURE_PI_SESSION")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
             pick_jsonl(&pi_root, &["toolCall", "toolResult", "thinking"]).expect("pick pi session")
         });
     sanitize_jsonl(&pi_path, &out.join("pi_real_sanitized.jsonl"))?;
 
-    let codex_path = env_path(
-        "CASH_FIXTURE_CODEX_SESSION",
-        "MIGRATE_FIXTURE_CODEX_SESSION",
-    )
-    .unwrap_or_else(|| {
-        pick_jsonl(&codex_root, &["function_call", "function_call_output"])
-            .expect("pick codex session")
-    });
+    let codex_path = env_value("CASH_FIXTURE_CODEX_SESSION")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            pick_jsonl(&codex_root, &["function_call", "function_call_output"])
+                .expect("pick codex session")
+        });
     sanitize_jsonl(&codex_path, &out.join("codex_real_sanitized.jsonl"))?;
 
-    let opencode_session = env_value(
-        "CASH_FIXTURE_OPENCODE_SESSION",
-        "MIGRATE_FIXTURE_OPENCODE_SESSION",
-    )
-    .unwrap_or_else(|| pick_opencode_session(&opencode_db).expect("pick opencode session"));
+    let opencode_session = env_value("CASH_FIXTURE_OPENCODE_SESSION")
+        .unwrap_or_else(|| pick_opencode_session(&opencode_db).expect("pick opencode session"));
     sanitize_opencode_sql(
         &opencode_db,
         &opencode_session,
@@ -50,16 +46,8 @@ fn main() -> Result<(), String> {
     Ok(())
 }
 
-fn env_path(name: &str, legacy: &str) -> Option<PathBuf> {
-    env_value(name, legacy)
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-}
-
-fn env_value(name: &str, legacy: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .or_else(|| std::env::var(legacy).ok())
+fn env_value(name: &str) -> Option<String> {
+    std::env::var(name).ok()
 }
 
 fn pick_jsonl(root: &Path, needles: &[&str]) -> Option<PathBuf> {

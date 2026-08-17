@@ -382,8 +382,10 @@ fn export_writes_seed_files_and_manifest() {
     assert!(dir.join("seed.json").exists());
     assert!(dir.join("seed.md").exists());
     assert!(dir.join("manifest.json").exists());
-    assert_eq!(manifest.source.agent, "pi");
-    assert!(manifest.target.is_none());
+    assert_eq!(manifest.copies().len(), 1, "seed starts with one peer copy");
+    assert_eq!(manifest.copies()[0].agent, "pi");
+    assert_eq!(manifest.copies()[0].session_id, "pi-sess-1");
+    assert!(manifest.source.is_none(), "new manifests write only the peer group");
 
     // seed.json round-trips back to an equivalent trace
     let raw = std::fs::read_to_string(dir.join("seed.json")).unwrap();
@@ -1658,6 +1660,299 @@ fn sync_appends_opencode_continuation_into_pi_as_native_records() {
     let _ = std::fs::remove_dir_all(&env.root);
 }
 
+/// Multi-hop chain: pi -> opencode -> codex. Continuing at the codex end and
+/// running `sync` propagates the delta back into BOTH the pi source and the
+/// opencode middle copy; a repeated sync is a no-op.
+#[test]
+fn sync_propagates_across_multi_hop_chain() {
+    let env = cli_pi_source_env("multi-hop");
+    let converted = run_convert_pi(&env, false);
+    assert!(
+        converted.status.success(),
+        "pi -> opencode convert failed: {}",
+        String::from_utf8_lossy(&converted.stderr)
+    );
+    let oc_session = manifest_target(&env.seed)["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Extend the chain opencode -> codex. No --seed: `convert` must find the
+    // existing seed by locating the opencode copy inside its mapping graph.
+    let codex_root = env.root.join("codex-root");
+    std::fs::create_dir_all(&codex_root).unwrap();
+    let to_codex = Command::new(env!("CARGO_BIN_EXE_cash"))
+        .args([
+            "convert",
+            "opencode",
+            &oc_session,
+            "codex",
+            "--opencode-db",
+            env.db.to_str().unwrap(),
+            "--codex-root",
+            codex_root.to_str().unwrap(),
+            "--pi-root",
+            env.pi_root.to_str().unwrap(),
+        ])
+        .env("CASH_SEED_DIR", &env.root)
+        .output()
+        .unwrap();
+    assert!(
+        to_codex.status.success(),
+        "opencode -> codex convert failed: {}",
+        String::from_utf8_lossy(&to_codex.stderr)
+    );
+
+    // The peer group now holds the original copy + two converted copies.
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(env.seed.join("manifest.json")).unwrap(),
+    )
+    .unwrap();
+    let nodes = manifest["nodes"].as_array().expect("nodes array");
+    assert_eq!(nodes.len(), 3, "expected pi + opencode + codex copies");
+    let codex_node = nodes
+        .iter()
+        .find(|node| node["agent"] == "codex")
+        .expect("codex copy present");
+
+    // Continue the codex copy after the imported anchor.
+    let codex_file = PathBuf::from(codex_node["file"].as_str().unwrap());
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&codex_file)
+        .unwrap();
+    for value in [
+        serde_json::json!({
+            "type": "response_item",
+            "timestamp": "2026-01-03T00:00:00.000Z",
+            "payload": {"type": "message", "id": "hop-user", "role": "user", "content": [{"type": "input_text", "text": "continued at the codex end"}]}
+        }),
+        serde_json::json!({
+            "type": "response_item",
+            "timestamp": "2026-01-03T00:00:01.000Z",
+            "payload": {"type": "message", "id": "hop-assistant", "role": "assistant", "content": [{"type": "output_text", "text": "codex end continuation"}]}
+        }),
+    ] {
+        use std::io::Write;
+        writeln!(file, "{}", serde_json::to_string(&value).unwrap()).unwrap();
+    }
+    drop(file);
+
+    // sync by the original source id: the codex delta must reach both other copies
+    let synced = run_sync_session(&env, "id_0001", false);
+    assert!(
+        synced.status.success(),
+        "multi-hop sync failed: {}",
+        String::from_utf8_lossy(&synced.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&synced.stdout).contains("synced"),
+        "unexpected sync output: {}",
+        String::from_utf8_lossy(&synced.stdout)
+    );
+
+    let pi_trace = readers::pi::read(&find_jsonl(&env.pi_root)).unwrap();
+    assert!(pi_trace.events.iter().any(|event| {
+        matches!(&event.kind, EventKind::UserMessage { text } if text == "continued at the codex end")
+    }));
+    assert!(pi_trace.events.iter().any(|event| {
+        matches!(&event.kind, EventKind::AssistantMessage { text } if text == "codex end continuation")
+    }));
+
+    let oc_trace = readers::opencode::read(&env.db, &oc_session).unwrap();
+    assert!(oc_trace.events.iter().any(|event| {
+        matches!(&event.kind, EventKind::UserMessage { text } if text == "continued at the codex end")
+    }));
+
+    // idempotent: a repeated sync appends nothing
+    let repeated = run_sync_session(&env, "id_0001", false);
+    assert!(repeated.status.success());
+    assert!(
+        String::from_utf8_lossy(&repeated.stdout).contains("no new events"),
+        "repeated sync should be a no-op: {}",
+        String::from_utf8_lossy(&repeated.stdout)
+    );
+    assert_eq!(
+        readers::pi::read(&find_jsonl(&env.pi_root))
+            .unwrap()
+            .events
+            .len(),
+        pi_trace.events.len()
+    );
+
+    let _ = std::fs::remove_dir_all(&env.root);
+}
+
+/// Chain `pi -> opencode -> codex` produces a flat peer group: three equal
+/// `nodes`, no `source`/`targets`/`target`/`sync` hierarchy in the manifest,
+/// and every node carries the same set of peer fields.
+#[test]
+fn convert_chain_builds_peer_node_group() {
+    let env = cli_pi_source_env("peer-group");
+    let converted = run_convert_pi(&env, false);
+    assert!(
+        converted.status.success(),
+        "pi -> opencode convert failed: {}",
+        String::from_utf8_lossy(&converted.stderr)
+    );
+    let oc_session = manifest_target(&env.seed)["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let codex_root = env.root.join("codex-root");
+    std::fs::create_dir_all(&codex_root).unwrap();
+    let to_codex = Command::new(env!("CARGO_BIN_EXE_cash"))
+        .args([
+            "convert",
+            "opencode",
+            &oc_session,
+            "codex",
+            "--opencode-db",
+            env.db.to_str().unwrap(),
+            "--codex-root",
+            codex_root.to_str().unwrap(),
+            "--pi-root",
+            env.pi_root.to_str().unwrap(),
+        ])
+        .env("CASH_SEED_DIR", &env.root)
+        .output()
+        .unwrap();
+    assert!(
+        to_codex.status.success(),
+        "opencode -> codex convert failed: {}",
+        String::from_utf8_lossy(&to_codex.stderr)
+    );
+
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(env.seed.join("manifest.json")).unwrap(),
+    )
+    .unwrap();
+    let nodes = manifest["nodes"].as_array().expect("nodes array");
+    assert_eq!(nodes.len(), 3, "peer group must hold pi + opencode + codex");
+
+    // All three copies are peers: same agent set, same field shape, no
+    // source/targets/target/sync legacy hierarchy in a fresh manifest.
+    let mut agents: Vec<&str> = nodes
+        .iter()
+        .map(|node| node["agent"].as_str().expect("node agent"))
+        .collect();
+    agents.sort_unstable();
+    assert_eq!(agents, vec!["codex", "opencode", "pi"]);
+    for node in nodes {
+        for field in [
+            "agent",
+            "session_id",
+            "file",
+            "anchor_message_id",
+            "events_sha256",
+        ] {
+            assert!(node.get(field).is_some(), "peer node missing {field}");
+        }
+    }
+    for legacy in ["source", "targets", "target", "sync"] {
+        assert!(
+            manifest.get(legacy).is_none(),
+            "fresh manifest must not carry legacy {legacy}"
+        );
+    }
+
+    // The converted copies reference live native sessions that status can read.
+    let status = Command::new(env!("CARGO_BIN_EXE_cash"))
+        .args([
+            "status",
+            env.seed.to_str().unwrap(),
+            "--opencode-db",
+            env.db.to_str().unwrap(),
+        ])
+        .env("CASH_SEED_DIR", &env.root)
+        .output()
+        .unwrap();
+    assert!(
+        status.status.success(),
+        "status failed: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let stdout = String::from_utf8(status.stdout).unwrap();
+    for agent in ["pi", "opencode", "codex"] {
+        assert!(
+            stdout.contains(&format!("NODE {agent}")),
+            "status must report every peer copy, missing {agent}:\n{stdout}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&env.root);
+}
+
+/// Legacy `source` + `target`/`sync` manifests migrate into the peer-node group
+/// on load, preserving anchors and hashes.
+#[test]
+fn legacy_manifest_migrates_into_peer_node_group() {
+    let dir =
+        std::env::temp_dir().join(format!("cash-legacy-migrate-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("manifest.json"),
+        serde_json::json!({
+            "version": 1,
+            "seed_files": ["seed.json", "seed.md"],
+            "source": {
+                "agent": "pi",
+                "session_id": "pi-old",
+                "file": "/tmp/pi.jsonl",
+                "file_sha256": "aaa",
+                "events_sha256": "hash-pi",
+                "event_count": 6,
+                "exported_at": "2026-01-01T00:00:00Z"
+            },
+            "target": {
+                "agent": "opencode",
+                "session_id": "ses_old",
+                "file": "/tmp/db/opencode.db(ses_old)",
+                "anchor_message_id": "msg_old",
+                "injected_at": "2026-01-01T00:00:00Z",
+                "events_sha256": "hash-open",
+                "seed_event_count": 6,
+                "native_message_count": 4,
+                "dropped_event_count": 1
+            },
+            "sync": {
+                "source_agent": "pi",
+                "source_session_id": "pi-old",
+                "source_file": "/tmp/pi.jsonl",
+                "source_events_sha256": "hash-pi-latest",
+                "target_agent": "opencode",
+                "target_session_id": "ses_old",
+                "target_file": "/tmp/db/opencode.db(ses_old)",
+                "target_anchor_message_id": "msg_old_latest",
+                "target_events_sha256": "hash-open-latest"
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let manifest = export::load_manifest(&dir).expect("load legacy manifest");
+    let nodes = manifest.copies();
+    assert_eq!(nodes.len(), 2);
+    let pi = &nodes[0];
+    assert_eq!((pi.agent.as_str(), pi.session_id.as_str()), ("pi", "pi-old"));
+    assert_eq!(pi.events_sha256, "hash-pi-latest", "sync anchor applied to source copy");
+    let open = &nodes[1];
+    assert_eq!(
+        (open.agent.as_str(), open.session_id.as_str()),
+        ("opencode", "ses_old")
+    );
+    assert_eq!(
+        open.anchor_message_id, "msg_old_latest",
+        "sync anchor applied to target copy"
+    );
+    assert_eq!(open.native_message_count, 4);
+    assert_eq!(open.dropped_event_count, 1);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 struct CliTestEnv {
     root: PathBuf,
     db: PathBuf,
@@ -1805,7 +2100,10 @@ fn find_jsonl(root: &std::path::Path) -> PathBuf {
 
 fn manifest_target(seed: &std::path::Path) -> serde_json::Value {
     let raw = std::fs::read_to_string(seed.join("manifest.json")).unwrap();
-    serde_json::from_str::<serde_json::Value>(&raw).unwrap()["target"].clone()
+    serde_json::from_str::<serde_json::Value>(&raw).unwrap()["nodes"]
+        .as_array()
+        .and_then(|nodes| nodes.last().cloned())
+        .expect("manifest has at least one node")
 }
 
 fn count_jsonl(root: &std::path::Path) -> usize {
