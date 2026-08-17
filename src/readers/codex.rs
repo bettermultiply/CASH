@@ -40,7 +40,7 @@ pub fn read(path: &Path) -> Result<Trace, String> {
             .get("payload")
             .and_then(|p| p.get("id"))
             .and_then(Value::as_str)
-            .map(strip_synthetic_suffix)
+            .map(source_id_for_response_item_id)
             .unwrap_or_else(|| format!("rec_{i:05}"));
         match t {
             "session_meta" => {
@@ -86,8 +86,8 @@ pub fn read(path: &Path) -> Result<Trace, String> {
                         let id = p
                             .get("call_id")
                             .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string();
+                            .map(source_call_id_for_imported_id)
+                            .unwrap_or_default();
                         let name = p
                             .get("name")
                             .and_then(Value::as_str)
@@ -120,8 +120,8 @@ pub fn read(path: &Path) -> Result<Trace, String> {
                         let call_id = p
                             .get("call_id")
                             .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string();
+                            .map(source_call_id_for_imported_id)
+                            .unwrap_or_default();
                         let output = p
                             .get("output")
                             .and_then(Value::as_str)
@@ -191,18 +191,57 @@ pub fn read(path: &Path) -> Result<Trace, String> {
     Ok(Trace { meta, events })
 }
 
-/// Several IR events derived from one native record share `original_id`; the
-/// Codex importer gives each written response_item a unique id by appending a
-/// deterministic `~N` suffix to later siblings. Strip it to restore the source
-/// original_id so codex -> codex round trips stay event-identical.
-fn strip_synthetic_suffix(id: &str) -> String {
-    match id.rfind('~') {
-        Some(split)
-            if split + 1 < id.len() && id[split + 1..].bytes().all(|b| b.is_ascii_digit()) =>
-        {
-            id[..split].to_string()
+/// Restore the source ID from a CASH-written response-item ID. Older CASH
+/// rollouts used suffixes, so retain compatibility while reading them.
+pub fn source_id_for_response_item_id(id: &str) -> String {
+    if let Some(source_id) = decode_imported_item_id(id) {
+        return source_id;
+    }
+    for marker in ["_cash_", "~"] {
+        if let Some(split) = id.rfind(marker) {
+            let suffix = &id[split + marker.len()..];
+            if !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()) {
+                return id[..split].to_string();
+            }
         }
-        _ => id.to_string(),
+    }
+    id.to_string()
+}
+
+fn source_call_id_for_imported_id(id: &str) -> String {
+    id.strip_prefix("call_cash_")
+        .and_then(decode_hex)
+        .unwrap_or_else(|| id.to_string())
+}
+
+fn decode_imported_item_id(id: &str) -> Option<String> {
+    let encoded = id.strip_prefix("cash_item_")?;
+    let (encoded, occurrence) = encoded.rsplit_once("_n_")?;
+    if occurrence.is_empty() || !occurrence.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    decode_hex(encoded)
+}
+
+fn decode_hex(encoded: &str) -> Option<String> {
+    if encoded.len() % 2 != 0 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(encoded.len() / 2);
+    for pair in encoded.as_bytes().chunks_exact(2) {
+        let high = hex_value(pair[0])?;
+        let low = hex_value(pair[1])?;
+        bytes.push((high << 4) | low);
+    }
+    String::from_utf8(bytes).ok()
+}
+
+fn hex_value(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
     }
 }
 

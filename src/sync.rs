@@ -42,23 +42,22 @@ pub fn check(manifest: &Manifest, opencode_db: &Path) -> Result<StatusReport, St
                 source_detail = format!("source file missing: {}", path.display());
                 (false, false)
             } else {
-                let file_hash = crate::util::sha256_file(path)?;
-                let file_unchanged = file_hash == manifest.source.file_sha256;
-                let events_unchanged =
-                    recheck_events(kind, &manifest.source.file, &manifest.source.events_sha256);
+                let expected_hash = sync_source_hash(manifest);
+                let events_unchanged = recheck_events(kind, &manifest.source.file, expected_hash);
                 let mut detail = format!("source file: {}", path.display());
-                if !file_unchanged {
+                if !events_unchanged {
                     detail.push_str("  [CHANGED]");
                 }
                 source_detail = detail;
-                (file_unchanged, events_unchanged)
+                (events_unchanged, events_unchanged)
             }
         }
         AgentKind::OpenCode => {
             let (db, _sid) = split_db_session(&manifest.source.file);
             let db = Path::new(db);
             let hash = opencode_session_hash(db, &manifest.source.session_id)?;
-            let unchanged = hash == manifest.source.events_sha256;
+            let expected_hash = sync_source_hash(manifest);
+            let unchanged = hash == expected_hash;
             let mut detail = format!(
                 "opencode source: {} ({})",
                 manifest.source.session_id,
@@ -81,7 +80,18 @@ pub fn check(manifest: &Manifest, opencode_db: &Path) -> Result<StatusReport, St
             extra_messages: 0,
             detail: "no target seeded yet (run `import opencode`)".into(),
         },
-        Some(target) => check_target(target, opencode_db),
+        Some(target) => {
+            let mut target = target.clone();
+            if let Some(sync) = manifest.sync.as_ref().filter(|sync| {
+                sync.target_agent == target.agent
+                    && sync.target_session_id == target.session_id
+                    && sync.target_file == target.file
+            }) {
+                target.anchor_message_id = sync.target_anchor_message_id.clone();
+                target.events_sha256 = sync.target_events_sha256.clone();
+            }
+            check_target(&target, opencode_db)
+        }
     };
 
     Ok(StatusReport {
@@ -98,12 +108,13 @@ fn check_target(target: &crate::export::TargetRef, db: &Path) -> TargetStatus {
     match target.agent.as_str() {
         "opencode" => check_opencode_target(target, db),
         "pi" => check_pi_target(target),
+        "codex" => check_codex_target(target),
         _ => TargetStatus {
             session_present: false,
             anchor_present: false,
             continued_past_seed: false,
             extra_messages: 0,
-            detail: format!("target agent {} not supported by status yet", target.agent),
+            detail: format!("unknown target agent {}", target.agent),
         },
     }
 }
@@ -237,6 +248,60 @@ fn check_pi_target(target: &crate::export::TargetRef) -> TargetStatus {
             "target pi anchor record missing".into()
         },
     }
+}
+
+fn check_codex_target(target: &crate::export::TargetRef) -> TargetStatus {
+    let path = Path::new(&target.file);
+    let trace = match readers::codex::read(path) {
+        Ok(trace) => trace,
+        Err(e) => {
+            return TargetStatus {
+                session_present: false,
+                anchor_present: false,
+                continued_past_seed: false,
+                extra_messages: 0,
+                detail: e,
+            };
+        }
+    };
+    let source_anchor = readers::codex::source_id_for_response_item_id(&target.anchor_message_id);
+    let anchor_index = trace.events.iter().rposition(|event| {
+        event.original_id == target.anchor_message_id || event.original_id == source_anchor
+    });
+    let anchor_present = anchor_index.is_some();
+    let extra_messages = anchor_index
+        .map(|index| trace.events.len().saturating_sub(index + 1))
+        .unwrap_or(0);
+    let continued = anchor_present && extra_messages > 0;
+    let events_match = trace.meta.events_sha256 == target.events_sha256;
+    TargetStatus {
+        session_present: true,
+        anchor_present,
+        continued_past_seed: continued,
+        extra_messages,
+        detail: if continued {
+            format!("target Codex session continued past seed point (+{extra_messages} events)")
+        } else if anchor_present && events_match {
+            "target Codex session is at the seed point (event hash matches)".into()
+        } else if anchor_present {
+            "target Codex session is at the seed point (event hash differs after native normalization)"
+                .into()
+        } else {
+            "target Codex anchor record missing".into()
+        },
+    }
+}
+
+fn sync_source_hash(manifest: &Manifest) -> &str {
+    manifest
+        .sync
+        .as_ref()
+        .filter(|sync| {
+            sync.source_agent == manifest.source.agent
+                && sync.source_session_id == manifest.source.session_id
+        })
+        .map(|sync| sync.source_events_sha256.as_str())
+        .unwrap_or(manifest.source.events_sha256.as_str())
 }
 
 fn recheck_events(kind: AgentKind, file: &str, expected: &str) -> bool {

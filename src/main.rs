@@ -77,6 +77,21 @@ enum Command {
         #[arg(long)]
         model: Option<String>,
     },
+    /// Append target-agent continuation back to the original source session
+    Sync {
+        /// Original source session ID; resolves its seed from CASH_SEED_DIR or config
+        session: Option<String>,
+        #[arg(short, long)]
+        seed: Option<PathBuf>,
+        #[arg(long)]
+        pi_root: Option<PathBuf>,
+        #[arg(long)]
+        codex_root: Option<PathBuf>,
+        #[arg(long)]
+        opencode_db: Option<PathBuf>,
+        #[arg(long)]
+        force: bool,
+    },
     /// Inspect source and target state recorded by a CASH seed
     Status {
         seed: Option<PathBuf>,
@@ -245,6 +260,24 @@ fn run(cli: Cli) -> Result<(), String> {
             print_import_result(target_kind, &seed, &result);
             Ok(())
         }
+        Command::Sync {
+            session,
+            seed,
+            pi_root,
+            codex_root,
+            opencode_db,
+            force,
+        } => {
+            let seed = resolve_sync_seed(session, seed)?;
+            sync_continuation(
+                &seed,
+                &pi_root.unwrap_or_else(default_pi_root),
+                &codex_root.unwrap_or_else(default_codex_root),
+                &opencode_db.unwrap_or_else(default_opencode_db),
+                force,
+            )?;
+            Ok(())
+        }
         Command::Status { seed, opencode_db } => {
             let seed = resolve_seed_dir(seed)?;
             let db = opencode_db.unwrap_or_else(default_opencode_db);
@@ -281,6 +314,247 @@ fn run(cli: Cli) -> Result<(), String> {
             Ok(())
         }
     }
+}
+
+fn sync_continuation(
+    seed: &Path,
+    pi_root: &Path,
+    codex_root: &Path,
+    opencode_db: &Path,
+    force: bool,
+) -> Result<(), String> {
+    let mut manifest = export::load_manifest(seed)?;
+    let source_kind: AgentKind = manifest.source.agent.parse()?;
+    let target = manifest
+        .target
+        .clone()
+        .ok_or_else(|| "seed has no target session; run convert first".to_string())?;
+    let target_kind: AgentKind = target.agent.parse()?;
+    let target_trace = read_bound_trace(target_kind, &target, pi_root, codex_root, opencode_db)?;
+    let sync = manifest.sync.as_ref().filter(|sync| {
+        sync.source_agent == manifest.source.agent
+            && sync.source_session_id == manifest.source.session_id
+            && sync.target_agent == target.agent
+            && sync.target_session_id == target.session_id
+    });
+    let anchor = sync
+        .map(|sync| sync.target_anchor_message_id.as_str())
+        .unwrap_or(target.anchor_message_id.as_str());
+    let anchor_index = target_trace
+        .events
+        .iter()
+        .rposition(|event| anchor_matches(target_kind, &event.original_id, anchor))
+        .ok_or_else(|| format!("target sync anchor {anchor} is missing"))?;
+    let all_delta = &target_trace.events[anchor_index + 1..];
+    if all_delta.is_empty() {
+        println!("no new events after {} anchor", target_kind);
+        return Ok(());
+    }
+
+    let source_trace = read_source_trace(source_kind, &manifest.source, opencode_db)?;
+    let expected_hash = sync
+        .map(|sync| sync.source_events_sha256.as_str())
+        .unwrap_or(manifest.source.events_sha256.as_str());
+    if source_trace.meta.events_sha256 != expected_hash && !force {
+        return Err(format!(
+            "original {} session changed since last sync; refusing to append {} (use --force)",
+            source_kind, manifest.source.session_id
+        ));
+    }
+
+    let delta: Vec<ir::Event> = all_delta
+        .iter()
+        .filter(|event| is_syncable_event(target_kind, event))
+        .cloned()
+        .collect();
+    if delta.is_empty() {
+        save_sync_ref(&mut manifest, &target, &source_trace, &target_trace);
+        export::save_manifest(seed, &manifest)?;
+        println!("no transferable events after {} anchor", target_kind);
+        return Ok(());
+    }
+    let delta_trace = ir::Trace {
+        meta: target_trace.meta.clone(),
+        events: delta.clone(),
+    };
+    let result = match source_kind {
+        AgentKind::OpenCode => import::opencode::append_existing(
+            &delta_trace,
+            opencode_db,
+            &manifest.source.session_id,
+        )?,
+        AgentKind::Pi | AgentKind::Codex => rewrite_source_with_delta(
+            source_kind,
+            &source_trace,
+            &delta,
+            Path::new(&manifest.source.file),
+            pi_root,
+            codex_root,
+        )?,
+    };
+    let updated_source = read_source_trace(source_kind, &manifest.source, opencode_db)?;
+    save_sync_ref(&mut manifest, &target, &updated_source, &target_trace);
+    export::save_manifest(seed, &manifest)?;
+    println!(
+        "synced {} {} events into {} session {} ({} records)",
+        delta.len(),
+        target_kind,
+        source_kind,
+        manifest.source.session_id,
+        result.message_count
+    );
+    println!("manifest updated: {}", seed.join("manifest.json").display());
+    Ok(())
+}
+
+fn is_syncable_event(kind: AgentKind, event: &ir::Event) -> bool {
+    if matches!(event.kind, ir::EventKind::NativeRecord { .. }) {
+        return false;
+    }
+    if kind != AgentKind::Codex {
+        return true;
+    }
+    if event
+        .native
+        .as_ref()
+        .and_then(|native| native.get("role"))
+        .and_then(serde_json::Value::as_str)
+        == Some("developer")
+    {
+        return false;
+    }
+    !matches!(
+        &event.kind,
+        ir::EventKind::UserMessage { text } if is_injected_codex_context(text)
+    )
+}
+
+fn is_injected_codex_context(text: &str) -> bool {
+    let text = text.trim_start();
+    [
+        "<environment_context>",
+        "<permissions instructions>",
+        "<collaboration_mode>",
+        "<plugins_instructions>",
+        "<skills_instructions>",
+        "<user_instructions>",
+        "# AGENTS.md instructions",
+    ]
+    .iter()
+    .any(|prefix| text.starts_with(prefix))
+}
+
+fn save_sync_ref(
+    manifest: &mut export::Manifest,
+    target: &export::TargetRef,
+    source_trace: &ir::Trace,
+    target_trace: &ir::Trace,
+) {
+    let last_target_event = target_trace.events.last().expect("target has anchor");
+    manifest.sync = Some(export::SyncRef {
+        source_agent: manifest.source.agent.clone(),
+        source_session_id: manifest.source.session_id.clone(),
+        source_file: manifest.source.file.clone(),
+        source_events_sha256: source_trace.meta.events_sha256.clone(),
+        target_agent: target.agent.clone(),
+        target_session_id: target.session_id.clone(),
+        target_file: target.file.clone(),
+        target_anchor_message_id: last_target_event.original_id.clone(),
+        target_events_sha256: target_trace.meta.events_sha256.clone(),
+    });
+}
+
+fn read_bound_trace(
+    kind: AgentKind,
+    target: &export::TargetRef,
+    pi_root: &Path,
+    codex_root: &Path,
+    opencode_db: &Path,
+) -> Result<ir::Trace, String> {
+    match kind {
+        AgentKind::OpenCode => readers::opencode::read(opencode_db, &target.session_id),
+        AgentKind::Pi | AgentKind::Codex => {
+            let root = if kind == AgentKind::Pi {
+                pi_root
+            } else {
+                codex_root
+            };
+            let path = resolve_bound_file(&target.file, root);
+            let trace =
+                readers::read_trace(kind, path.to_string_lossy().as_ref(), root, opencode_db)?;
+            if trace.meta.session_id != target.session_id {
+                return Err(format!(
+                    "target {} session ID mismatch: manifest={}, file={}",
+                    kind, target.session_id, trace.meta.session_id
+                ));
+            }
+            Ok(trace)
+        }
+    }
+}
+
+fn read_source_trace(
+    kind: AgentKind,
+    source: &export::SourceRef,
+    opencode_db: &Path,
+) -> Result<ir::Trace, String> {
+    match kind {
+        AgentKind::OpenCode => readers::opencode::read(opencode_db, &source.session_id),
+        AgentKind::Pi => readers::pi::read(Path::new(&source.file)),
+        AgentKind::Codex => readers::codex::read(Path::new(&source.file)),
+    }
+}
+
+fn rewrite_source_with_delta(
+    kind: AgentKind,
+    source_trace: &ir::Trace,
+    delta: &[ir::Event],
+    source_file: &Path,
+    pi_root: &Path,
+    codex_root: &Path,
+) -> Result<import::ImportResult, String> {
+    let mut trace = source_trace.clone();
+    trace.events.extend_from_slice(delta);
+    match kind {
+        AgentKind::Pi => import::pi::import_existing(
+            &trace,
+            pi_root,
+            Some(source_file),
+            Some(&source_trace.meta.session_id),
+            None,
+            true,
+            None,
+        ),
+        AgentKind::Codex => import::codex::import_existing(
+            &trace,
+            codex_root,
+            Some(source_file),
+            Some(&source_trace.meta.session_id),
+            None,
+            true,
+            None,
+        ),
+        AgentKind::OpenCode => unreachable!(),
+    }
+}
+
+fn resolve_bound_file(file: &str, root: &Path) -> PathBuf {
+    let path = Path::new(file);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    }
+}
+
+fn anchor_matches(kind: AgentKind, event_id: &str, anchor: &str) -> bool {
+    if event_id == anchor {
+        return true;
+    }
+    if kind != AgentKind::Codex {
+        return false;
+    }
+    event_id == readers::codex::source_id_for_response_item_id(anchor)
 }
 
 fn parse_agent(s: &str) -> Result<AgentKind, String> {
@@ -397,6 +671,37 @@ fn print_import_result(kind: AgentKind, seed: &Path, result: &import::ImportResu
         );
     }
     println!("manifest updated: {}", seed.join("manifest.json").display());
+}
+
+fn resolve_sync_seed(session: Option<String>, seed: Option<PathBuf>) -> Result<PathBuf, String> {
+    match (session, seed) {
+        (Some(_), Some(_)) => Err("pass either a source session ID or --seed, not both".into()),
+        (Some(session_id), None) => {
+            let mut matches = Vec::new();
+            for kind in [AgentKind::OpenCode, AgentKind::Pi, AgentKind::Codex] {
+                let candidate = config::default_seed_output(kind.as_str(), &session_id);
+                let Ok(manifest) = export::load_manifest(&candidate) else {
+                    continue;
+                };
+                if manifest.source.agent == kind.as_str()
+                    && manifest.source.session_id == session_id
+                {
+                    matches.push(candidate);
+                }
+            }
+            match matches.len() {
+                1 => Ok(matches.remove(0)),
+                0 => Err(format!(
+                    "no seed found for source session {session_id} under {}",
+                    config::default_seed_dir().display()
+                )),
+                _ => Err(format!(
+                    "source session ID {session_id} has multiple seeds; use --seed to choose one"
+                )),
+            }
+        }
+        (None, seed) => resolve_seed_dir(seed),
+    }
 }
 
 fn resolve_seed_dir(seed: Option<PathBuf>) -> Result<PathBuf, String> {

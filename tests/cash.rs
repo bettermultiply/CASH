@@ -417,6 +417,37 @@ fn import_into_opencode_round_trips() {
     let back = readers::opencode::read(&db, &result.session_id).expect("re-read");
     assert_eq!(back.events.len(), trace.events.len() - 1);
 
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let (agent, model): (String, String) = conn
+        .query_row(
+            "SELECT agent, model FROM session WHERE id = ?1",
+            [&result.session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(agent, "build");
+    let model: serde_json::Value = serde_json::from_str(&model).unwrap();
+    assert_eq!(model["id"], "deepseek-v4-flash");
+    assert_eq!(model["providerID"], "deepseek");
+
+    let messages: Vec<(String, serde_json::Value)> = conn
+        .prepare("SELECT id, data FROM message WHERE session_id = ?1 ORDER BY time_created, id")
+        .unwrap()
+        .query_map([&result.session_id], |row| {
+            let id: String = row.get(0)?;
+            let raw: String = row.get(1)?;
+            Ok((id, serde_json::from_str(&raw).unwrap()))
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(messages[0].1["role"], "user");
+    assert!(messages[0].1.get("parentID").is_none());
+    assert_eq!(messages[1].1["role"], "assistant");
+    assert_eq!(messages[1].1["parentID"], messages[0].0);
+    assert_eq!(messages[2].1["role"], "assistant");
+    assert_eq!(messages[2].1["parentID"], messages[1].0);
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -542,6 +573,13 @@ fn codex_import_produces_resumable_rollout() {
         if t == "response_item" {
             let id = line["payload"]["id"].as_str().unwrap();
             assert!(
+                !id.is_empty()
+                    && id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')),
+                "Codex response-item id is not API-safe: {id}"
+            );
+            assert!(
                 response_ids.insert(id.to_string()),
                 "duplicate response_item id {id}"
             );
@@ -585,6 +623,53 @@ fn codex_import_produces_resumable_rollout() {
             &result.anchor_message_id
         )
         .expect("anchor check")
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn codex_import_encodes_unsafe_ids_without_losing_the_trace() {
+    let mut trace = readers::codex::read(&fixture("codex.jsonl")).unwrap();
+    for event in &mut trace.events {
+        event.original_id = "msg with spaces~and punctuation".into();
+        match &mut event.kind {
+            EventKind::ToolCall { id, .. } => *id = "call with spaces~and punctuation".into(),
+            EventKind::ToolResult { call_id, .. } => {
+                *call_id = "call with spaces~and punctuation".into()
+            }
+            _ => {}
+        }
+    }
+
+    let dir = std::env::temp_dir().join(format!(
+        "cash-codex-unsafe-id-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let result = import::codex::import(&trace, &dir).expect("import codex");
+    let lines = load_jsonl(std::path::Path::new(&result.file));
+
+    for line in lines.iter().filter(|line| line["type"] == "response_item") {
+        for field in ["id", "call_id"] {
+            let Some(id) = line["payload"][field].as_str() else {
+                continue;
+            };
+            assert!(
+                !id.is_empty()
+                    && id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')),
+                "Codex {field} is not API-safe: {id}"
+            );
+        }
+    }
+
+    let back = readers::codex::read(std::path::Path::new(&result.file)).unwrap();
+    assert_eq!(
+        serde_json::to_string(&trace.events).unwrap(),
+        serde_json::to_string(&back.events).unwrap(),
+        "Codex ID encoding changed the event trace"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -758,6 +843,196 @@ fn convert_command_updates_same_pi_session_instead_of_duplicating() {
 }
 
 #[test]
+fn sync_appends_pi_continuation_to_original_opencode_session() {
+    let env = cli_test_env("sync-back");
+    let first = run_convert(&env, false);
+    assert!(
+        first.status.success(),
+        "first convert failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let target = manifest_target(&env.seed);
+    let target_file = PathBuf::from(target["file"].as_str().unwrap());
+    let anchor = target["anchor_message_id"].as_str().unwrap();
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&target_file)
+        .unwrap();
+    for value in [
+        serde_json::json!({
+            "type": "message",
+            "id": "sync-user",
+            "parentId": anchor,
+            "timestamp": "2026-01-02T00:00:00.000Z",
+            "message": {"role": "user", "content": [{"type": "text", "text": "continue in pi"}]}
+        }),
+        serde_json::json!({
+            "type": "message",
+            "id": "sync-assistant",
+            "parentId": "sync-user",
+            "timestamp": "2026-01-02T00:00:01.000Z",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "pi continuation"}], "model": "cash", "provider": "cash", "api": "cash", "stopReason": "stop", "usage": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0, "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}}}
+        }),
+    ] {
+        use std::io::Write;
+        writeln!(file, "{}", serde_json::to_string(&value).unwrap()).unwrap();
+    }
+
+    let before = count_opencode_messages(&env.db, "opencode-real-sanitized");
+    let synced = run_sync(&env, false);
+    assert!(
+        synced.status.success(),
+        "sync failed: {}",
+        String::from_utf8_lossy(&synced.stderr)
+    );
+    let after = count_opencode_messages(&env.db, "opencode-real-sanitized");
+    assert_eq!(after, before + 2);
+    assert_eq!(
+        count_opencode_sessions(&env.db, "opencode-real-sanitized"),
+        1
+    );
+
+    let status = Command::new(env!("CARGO_BIN_EXE_cash"))
+        .args([
+            "status",
+            env.seed.to_str().unwrap(),
+            "--opencode-db",
+            env.db.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        status.status.success(),
+        "status failed: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status_stdout = String::from_utf8(status.stdout).unwrap();
+    assert!(status_stdout.contains("file hash unchanged: yes"));
+    assert!(status_stdout.contains("continued past seed: NO"));
+
+    let repeated = run_sync(&env, false);
+    assert!(
+        repeated.status.success(),
+        "repeated sync failed: {}",
+        String::from_utf8_lossy(&repeated.stderr)
+    );
+    assert_eq!(
+        count_opencode_messages(&env.db, "opencode-real-sanitized"),
+        after
+    );
+    assert!(String::from_utf8_lossy(&repeated.stdout).contains("no new events"));
+
+    let _ = std::fs::remove_dir_all(&env.root);
+}
+
+#[test]
+fn sync_appends_codex_continuation_to_original_pi_session() {
+    let root = std::env::temp_dir().join(format!(
+        "cash-sync-codex-pi-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let pi_root = root.join("pi-root");
+    let codex_root = root.join("codex-root");
+    let seed_root = root.join("seeds");
+    std::fs::create_dir_all(&pi_root).unwrap();
+    std::fs::create_dir_all(&codex_root).unwrap();
+    let source_file = pi_root.join("source.jsonl");
+    std::fs::copy(fixture("pi.jsonl"), &source_file).unwrap();
+
+    let converted = Command::new(env!("CARGO_BIN_EXE_cash"))
+        .args([
+            "convert",
+            "pi",
+            "pi-sess-1",
+            "codex",
+            "--pi-root",
+            pi_root.to_str().unwrap(),
+            "--codex-root",
+            codex_root.to_str().unwrap(),
+        ])
+        .env("CASH_SEED_DIR", &seed_root)
+        .output()
+        .unwrap();
+    assert!(
+        converted.status.success(),
+        "convert failed: {}",
+        String::from_utf8_lossy(&converted.stderr)
+    );
+    let seed = seed_root.join("pi").join("pi-sess-1");
+    let target = manifest_target(&seed);
+    let target_file = PathBuf::from(target["file"].as_str().unwrap());
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&target_file)
+        .unwrap();
+    for value in [
+        serde_json::json!({
+            "type": "response_item",
+            "timestamp": "2026-01-02T00:00:00.000Z",
+            "payload": {"type": "message", "id": "developer-context", "role": "developer", "content": [{"type": "input_text", "text": "<permissions instructions>internal</permissions instructions>"}]}
+        }),
+        serde_json::json!({
+            "type": "response_item",
+            "timestamp": "2026-01-02T00:00:01.000Z",
+            "payload": {"type": "message", "id": "environment-context", "role": "user", "content": [{"type": "input_text", "text": "<environment_context>internal</environment_context>"}]}
+        }),
+        serde_json::json!({
+            "type": "response_item",
+            "timestamp": "2026-01-02T00:00:02.000Z",
+            "payload": {"type": "message", "id": "codex-user", "role": "user", "content": [{"type": "input_text", "text": "continued in codex"}]}
+        }),
+        serde_json::json!({
+            "type": "response_item",
+            "timestamp": "2026-01-02T00:00:03.000Z",
+            "payload": {"type": "message", "id": "codex-assistant", "role": "assistant", "content": [{"type": "output_text", "text": "codex continuation"}]}
+        }),
+    ] {
+        use std::io::Write;
+        writeln!(file, "{}", serde_json::to_string(&value).unwrap()).unwrap();
+    }
+    drop(file);
+
+    let run_sync = || {
+        Command::new(env!("CARGO_BIN_EXE_cash"))
+            .args([
+                "sync",
+                "pi-sess-1",
+                "--pi-root",
+                pi_root.to_str().unwrap(),
+                "--codex-root",
+                codex_root.to_str().unwrap(),
+            ])
+            .env("CASH_SEED_DIR", &seed_root)
+            .output()
+            .unwrap()
+    };
+    let synced = run_sync();
+    assert!(
+        synced.status.success(),
+        "sync failed: {}",
+        String::from_utf8_lossy(&synced.stderr)
+    );
+    let trace = readers::pi::read(&source_file).unwrap();
+    assert_eq!(trace.events.len(), 8);
+    assert!(trace.events.iter().any(
+        |event| matches!(&event.kind, EventKind::UserMessage { text } if text == "continued in codex")
+    ));
+    assert!(trace.events.iter().any(
+        |event| matches!(&event.kind, EventKind::AssistantMessage { text } if text == "codex continuation")
+    ));
+    assert!(!trace.events.iter().any(|event| {
+        matches!(&event.kind, EventKind::UserMessage { text } if text.contains("environment_context") || text.contains("permissions instructions"))
+    }));
+
+    let repeated = run_sync();
+    assert!(repeated.status.success());
+    assert_eq!(readers::pi::read(&source_file).unwrap().events.len(), 8);
+    assert!(String::from_utf8_lossy(&repeated.stdout).contains("no new events"));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn convert_refuses_continued_pi_target_unless_forced() {
     let env = cli_test_env("conflict");
     let first = run_convert(&env, false);
@@ -877,8 +1152,510 @@ fn opencode_import_updates_same_session_and_protects_continuation() {
         )
         .unwrap();
     assert_eq!(continued, 0);
+    // --force must also rebuild the v2 event log and projection consistently
+    // (regression: the force path used to leave stale rows behind).
+    let events: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM event WHERE aggregate_id = ?1",
+            [&first.session_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let seq_row: i64 = conn
+        .query_row(
+            "SELECT seq FROM event_sequence WHERE aggregate_id = ?1",
+            [&first.session_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(seq_row, events, "event_sequence must match the event log");
+    assert!(events > 0);
+    let projected: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM session_message WHERE session_id = ?1",
+            [&first.session_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(projected, 3); // user + assistant + toolResult groups
+    let messages: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM message WHERE session_id = ?1",
+            [&first.session_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(projected, messages, "projection and legacy rows must agree");
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Bug 1 regression: after `convert pi -> opencode`, the OpenCode CLI TUI reads
+/// the legacy `message`/`part` tables with a strict v1 schema, and the web app
+/// reads the v2 `session_message` projection backed by the durable `event` log.
+/// All three stores must be displayable and consistent.
+#[test]
+fn opencode_import_writes_displayable_legacy_and_v2_state() {
+    let trace = readers::pi::read(&real_fixture("pi_real_sanitized.jsonl")).unwrap();
+    let dir =
+        std::env::temp_dir().join(format!("cash-v2db-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("opencode.db");
+    create_schema(&db);
+
+    let result = import::opencode::import(&trace, &db).expect("import");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let session = &result.session_id;
+
+    // -- legacy message rows satisfy the strict v1 schema the TUI decodes
+    let messages: Vec<serde_json::Value> = conn
+        .prepare("SELECT data FROM message WHERE session_id = ?1 ORDER BY time_created, id")
+        .unwrap()
+        .query_map([session], |row| {
+            let raw: String = row.get(0)?;
+            Ok(serde_json::from_str(&raw).unwrap())
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(messages.len() > 50, "rich fixture should import many messages");
+    let mut user_count = 0;
+    for message in &messages {
+        let role = message["role"].as_str().expect("role");
+        assert!(
+            message
+                .pointer("/time/created")
+                .and_then(serde_json::Value::as_i64)
+                .is_some(),
+            "message missing time.created: {message}"
+        );
+        assert!(message.get("agent").and_then(serde_json::Value::as_str).is_some());
+        match role {
+            "user" => {
+                user_count += 1;
+                assert!(message
+                    .pointer("/model/providerID")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some());
+                assert!(message
+                    .pointer("/model/modelID")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some());
+            }
+            "assistant" => {
+                assert!(message.get("parentID").and_then(serde_json::Value::as_str).is_some());
+                for field in ["modelID", "providerID", "mode", "agent", "cost", "finish"] {
+                    assert!(message.get(field).is_some(), "assistant missing {field}");
+                }
+                assert!(message.pointer("/path/cwd").and_then(serde_json::Value::as_str).is_some());
+                assert!(message.pointer("/path/root").and_then(serde_json::Value::as_str).is_some());
+                assert!(message
+                    .pointer("/tokens/input")
+                    .and_then(serde_json::Value::as_i64)
+                    .is_some());
+                assert!(message
+                    .pointer("/tokens/cache/read")
+                    .and_then(serde_json::Value::as_i64)
+                    .is_some());
+            }
+            other => panic!("unexpected role {other}"),
+        }
+    }
+    assert!(user_count >= 3);
+
+    // -- legacy parts: reasoning carries time; tool parts carry callID/tool/state
+    let parts: Vec<serde_json::Value> = conn
+        .prepare("SELECT data FROM part WHERE session_id = ?1")
+        .unwrap()
+        .query_map([session], |row| {
+            let raw: String = row.get(0)?;
+            Ok(serde_json::from_str(&raw).unwrap())
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    for part in &parts {
+        match part["type"].as_str().unwrap_or_default() {
+            "reasoning" => {
+                assert!(part
+                    .pointer("/time/start")
+                    .and_then(serde_json::Value::as_i64)
+                    .is_some());
+                assert!(part
+                    .pointer("/time/end")
+                    .and_then(serde_json::Value::as_i64)
+                    .is_some());
+            }
+            "tool" => {
+                assert!(part.get("callID").and_then(serde_json::Value::as_str).is_some());
+                assert!(part.get("tool").and_then(serde_json::Value::as_str).is_some());
+                let status = part
+                    .pointer("/state/status")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                assert!(
+                    matches!(status, "pending" | "running" | "completed" | "error"),
+                    "bad tool state {status}"
+                );
+            }
+            _ => {}
+        }
+    }
+    assert!(parts.iter().any(|p| p["type"] == "reasoning"));
+    assert!(parts.iter().any(|p| p["type"] == "tool"));
+
+    // -- v2 session_message projection rows
+    let projected: Vec<(String, String, i64, serde_json::Value)> = conn
+        .prepare("SELECT id, type, seq, data FROM session_message WHERE session_id = ?1 ORDER BY seq")
+        .unwrap()
+        .query_map([session], |row| {
+            let raw: String = row.get(3)?;
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                serde_json::from_str(&raw).unwrap(),
+            ))
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(projected.len(), messages.len());
+    let mut prev_seq = 0i64;
+    for (id, mtype, seq, data) in &projected {
+        assert!(seq > &prev_seq, "seq must be strictly increasing");
+        prev_seq = *seq;
+        assert!(id.starts_with("msg_"));
+        assert!(data
+            .pointer("/time/created")
+            .and_then(serde_json::Value::as_i64)
+            .is_some());
+        match mtype.as_str() {
+            "user" => {
+                assert!(data.get("text").and_then(serde_json::Value::as_str).is_some());
+                assert!(data.get("agent").is_none());
+            }
+            "assistant" => {
+                assert!(data.get("agent").and_then(serde_json::Value::as_str).is_some());
+                assert!(data
+                    .pointer("/model/id")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some());
+                assert!(data
+                    .pointer("/model/providerID")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some());
+                assert!(data.get("finish").and_then(serde_json::Value::as_str).is_some());
+                assert!(data
+                    .pointer("/tokens/input")
+                    .and_then(serde_json::Value::as_i64)
+                    .is_some());
+                let content = data.get("content").and_then(serde_json::Value::as_array).unwrap();
+                for item in content {
+                    let t = item["type"].as_str().expect("content type");
+                    assert!(matches!(t, "text" | "reasoning" | "tool"));
+                }
+            }
+            other => panic!("unexpected projected type {other}"),
+        }
+    }
+
+    // -- v2 durable event log: versioned types, seq continuity, ordering
+    let events: Vec<(i64, String, serde_json::Value)> = conn
+        .prepare("SELECT seq, type, data FROM event WHERE aggregate_id = ?1 ORDER BY seq")
+        .unwrap()
+        .query_map([session], |row| {
+            let raw: String = row.get(2)?;
+            Ok((row.get(0)?, row.get(1)?, serde_json::from_str(&raw).unwrap()))
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let seq_row: i64 = conn
+        .query_row(
+            "SELECT seq FROM event_sequence WHERE aggregate_id = ?1",
+            [session],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(seq_row as usize, events.len());
+    for (i, (seq, etype, data)) in events.iter().enumerate() {
+        assert_eq!(*seq, i as i64 + 1, "seq must start at 1 and be contiguous");
+        assert!(
+            etype.ends_with(".1") || etype.ends_with(".2"),
+            "unversioned event {etype}"
+        );
+        assert!(data.get("sessionID").and_then(serde_json::Value::as_str) == Some(session));
+        assert!(data
+            .get("timestamp")
+            .and_then(serde_json::Value::as_i64)
+            .is_some());
+    }
+
+    // per assistant message the event order must be:
+    // step.started -> content events (text/reasoning/tool) -> step.ended,
+    // so the event replay reducer can attach parts to the message.
+    let mut order: std::collections::BTreeMap<&str, Vec<&str>> = std::collections::BTreeMap::new();
+    for (_, etype, data) in &events {
+        let msg = data
+            .get("assistantMessageID")
+            .or_else(|| data.get("messageID"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let short = etype.trim_end_matches(".1").trim_end_matches(".2");
+        order.entry(msg).or_default().push(short);
+    }
+    for (msg, seqs) in &order {
+        if msg.is_empty() {
+            continue;
+        }
+        let steps: Vec<&&str> = seqs
+            .iter()
+            .filter(|t| t.starts_with("session.next.step."))
+            .collect();
+        if steps.is_empty() {
+            continue; // user prompts only carry session.next.prompted
+        }
+        assert_eq!(
+            steps.first(),
+            Some(&&"session.next.step.started"),
+            "step.started must come first for {msg}"
+        );
+        assert_eq!(
+            steps.last(),
+            Some(&&"session.next.step.ended"),
+            "step.ended must come last for {msg}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Bug 2 regression: `sync` (opencode -> pi) must append records that Pi's TUI
+/// can actually display: Pi-native message shapes and a parentId chain that
+/// reaches every record (Pi rebuilds its view by walking parentId from the
+/// leaf, so foreign ids from OpenCode used to truncate the chain).
+#[test]
+fn sync_appends_opencode_continuation_into_pi_as_native_records() {
+    let env = cli_pi_source_env("oc-to-pi");
+    let converted = run_convert_pi(&env, false);
+    assert!(
+        converted.status.success(),
+        "convert failed: {}",
+        String::from_utf8_lossy(&converted.stderr)
+    );
+    let target = manifest_target(&env.seed);
+    let opencode_session = target["session_id"].as_str().unwrap().to_string();
+
+    // Simulate the OpenCode server continuing the session (it writes legacy
+    // v1-shaped messages, some of which have no parts when generation fails).
+    //   A: user with a text part
+    //   B: assistant with NO parts (failed generation) -- the reader skips it,
+    //      but the next message still references it as parent
+    //   C: user with a text part
+    //   D: assistant with reasoning + text parts
+    let conn = rusqlite::Connection::open(&env.db).unwrap();
+    let last_time: i64 = conn
+        .query_row(
+            "SELECT MAX(time_created) FROM message WHERE session_id = ?1",
+            [&opencode_session],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let insert_message = |conn: &rusqlite::Connection,
+                          id: &str,
+                          time: i64,
+                          data: serde_json::Value| {
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data)
+             VALUES (?1, ?2, ?3, ?3, ?4)",
+            rusqlite::params![id, &opencode_session, time, serde_json::to_string(&data).unwrap()],
+        )
+        .unwrap();
+    };
+    let insert_part = |conn: &rusqlite::Connection,
+                       id: &str,
+                       message_id: &str,
+                       time: i64,
+                       data: serde_json::Value| {
+        conn.execute(
+            "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
+             VALUES (?1, ?2, ?3, ?4, ?4, ?5)",
+            rusqlite::params![
+                id,
+                message_id,
+                &opencode_session,
+                time,
+                serde_json::to_string(&data).unwrap()
+            ],
+        )
+        .unwrap();
+    };
+    let user_data = |text: &str, t: i64| {
+        serde_json::json!({
+            "role": "user",
+            "time": {"created": t},
+            "agent": "build",
+            "model": {"providerID": "deepseek", "modelID": "deepseek-v4-flash"},
+            "summary": {"diffs": []}
+        })
+    };
+    let assistant_data = |parent: &str, t: i64| {
+        serde_json::json!({
+            "parentID": parent,
+            "role": "assistant",
+            "mode": "build",
+            "agent": "build",
+            "path": {"cwd": "/tmp", "root": "/tmp"},
+            "cost": 0.000123,
+            "tokens": {"input": 10, "output": 20, "reasoning": 5, "cache": {"read": 7, "write": 0}},
+            "modelID": "deepseek-v4-flash",
+            "providerID": "deepseek",
+            "time": {"created": t, "completed": t + 100}
+        })
+    };
+    let mut t = last_time;
+    t += 1;
+    insert_message(&conn, "msg_cont_user_a", t, user_data("continue in opencode", t));
+    insert_part(&conn, "prt_cont_a", "msg_cont_user_a", t, serde_json::json!({"type": "text", "text": "continue in opencode"}));
+    t += 1;
+    insert_message(&conn, "msg_cont_empty_b", t, assistant_data("msg_cont_user_a", t));
+    t += 1;
+    insert_message(&conn, "msg_cont_user_c", t, user_data("and again", t));
+    insert_part(&conn, "prt_cont_c", "msg_cont_user_c", t, serde_json::json!({"type": "text", "text": "and again"}));
+    t += 1;
+    insert_message(&conn, "msg_cont_assistant_d", t, assistant_data("msg_cont_user_c", t));
+    insert_part(
+        &conn,
+        "prt_cont_d1",
+        "msg_cont_assistant_d",
+        t,
+        serde_json::json!({
+            "type": "reasoning",
+            "text": "thinking about it",
+            "time": {"start": t, "end": t}
+        }),
+    );
+    insert_part(
+        &conn,
+        "prt_cont_d2",
+        "msg_cont_assistant_d",
+        t,
+        serde_json::json!({"type": "text", "text": "the continuation answer"}),
+    );
+    drop(conn);
+
+    let synced = run_sync_session(&env, "id_0001", false);
+    assert!(
+        synced.status.success(),
+        "sync failed: {}",
+        String::from_utf8_lossy(&synced.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&synced.stdout).contains("synced"),
+        "unexpected sync output: {}",
+        String::from_utf8_lossy(&synced.stdout)
+    );
+
+    let file = find_jsonl(&env.pi_root);
+    let entries = load_jsonl(&file);
+    let by_id: std::collections::HashMap<&str, &serde_json::Value> = entries
+        .iter()
+        .map(|e| (e["id"].as_str().unwrap(), e))
+        .collect();
+    // A, C, D were synced; the empty assistant B has no events and is skipped
+    let synced_entries: Vec<&serde_json::Value> = entries
+        .iter()
+        .filter(|e| {
+            e.get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(|id| id.starts_with("msg_"))
+                .unwrap_or(false)
+        })
+        .collect();
+    assert_eq!(
+        synced_entries.len(),
+        3,
+        "expected synced records A, C, D: {}",
+        serde_json::to_string(&synced_entries).unwrap()
+    );
+
+    // every record's parentId must exist in the file (or be null)
+    for entry in &entries {
+        match entry["parentId"].as_str() {
+            None | Some("") => {}
+            Some(pid) => assert!(
+                by_id.contains_key(pid),
+                "dangling parentId {pid} in {}",
+                serde_json::to_string(entry).unwrap()
+            ),
+        }
+    }
+
+    // Pi's buildSessionPath: walking parentId from the leaf reaches every
+    // record except the session header (nothing references it).
+    let leaf = entries.last().unwrap();
+    let mut path = Vec::new();
+    let mut current = Some(leaf);
+    while let Some(entry) = current {
+        path.push(entry);
+        current = entry["parentId"].as_str().and_then(|pid| by_id.get(pid).copied());
+    }
+    let non_header = entries
+        .iter()
+        .filter(|e| e.get("type").and_then(serde_json::Value::as_str) != Some("session"))
+        .count();
+    assert_eq!(
+        path.len(),
+        non_header,
+        "parentId chain must reach every record (Pi renders only the chain)"
+    );
+
+    // synced assistant is Pi-native and maps provider/model/usage from OpenCode
+    let d_msg = &by_id["msg_cont_assistant_d"]["message"];
+    assert_eq!(d_msg["role"], "assistant");
+    assert_eq!(d_msg["provider"], "deepseek");
+    assert_eq!(d_msg["model"], "deepseek-v4-flash");
+    for field in ["api", "usage", "stopReason", "timestamp"] {
+        assert!(d_msg.get(field).is_some(), "assistant missing {field}");
+    }
+    for foreign in ["agent", "modelID", "providerID", "path", "tokens", "time", "finish", "cost", "summary"] {
+        assert!(
+            d_msg.get(foreign).is_none(),
+            "opencode field {foreign} leaked into pi assistant record"
+        );
+    }
+    let content = d_msg["content"].as_array().unwrap();
+    assert!(content.iter().any(|c| c["type"] == "thinking" && c["thinking"] == "thinking about it"));
+    let text = content
+        .iter()
+        .find(|c| c["type"] == "text")
+        .and_then(|c| c["text"].as_str())
+        .unwrap();
+    assert_eq!(text, "the continuation answer");
+    assert_eq!(d_msg["usage"]["totalTokens"].as_i64(), Some(42)); // 10+20+5+7
+
+    // synced users are Pi-native (no opencode user fields leaked)
+    for id in ["msg_cont_user_a", "msg_cont_user_c"] {
+        let m = &by_id[id]["message"];
+        assert_eq!(m["role"], "user");
+        assert!(m.get("timestamp").is_some());
+        for foreign in ["agent", "model", "summary", "time"] {
+            assert!(
+                m.get(foreign).is_none(),
+                "opencode field {foreign} leaked into pi user record"
+            );
+        }
+    }
+
+    // idempotent: a second sync appends nothing
+    let before = count_jsonl(&env.pi_root);
+    let repeated = run_sync_session(&env, "id_0001", false);
+    assert!(repeated.status.success());
+    assert!(String::from_utf8_lossy(&repeated.stdout).contains("no new events"));
+    assert_eq!(count_jsonl(&env.pi_root), before);
+
+    let _ = std::fs::remove_dir_all(&env.root);
 }
 
 struct CliTestEnv {
@@ -902,20 +1679,102 @@ fn cli_test_env(label: &str) -> CliTestEnv {
         .execute_batch(&sql)
         .unwrap();
     CliTestEnv {
-        seed: root.join("seed"),
+        seed: root.join("opencode").join("opencode-real-sanitized"),
         pi_root: root.join("pi-root"),
         root,
         db,
     }
 }
 
+fn run_sync(env: &CliTestEnv, force: bool) -> std::process::Output {
+    run_sync_session(env, "opencode-real-sanitized", force)
+}
+
+fn run_sync_session(env: &CliTestEnv, session: &str, force: bool) -> std::process::Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cash"));
+    command.args([
+        "sync",
+        session,
+        "--pi-root",
+        env.pi_root.to_str().unwrap(),
+        "--opencode-db",
+        env.db.to_str().unwrap(),
+    ]);
+    command.env("CASH_SEED_DIR", &env.root);
+    if force {
+        command.arg("--force");
+    }
+    command.output().unwrap()
+}
+
+fn count_opencode_messages(db: &std::path::Path, session: &str) -> i64 {
+    rusqlite::Connection::open(db)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM message WHERE session_id = ?1",
+            [session],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+fn count_opencode_sessions(db: &std::path::Path, session: &str) -> i64 {
+    rusqlite::Connection::open(db)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM session WHERE id = ?1",
+            [session],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
 fn run_convert(env: &CliTestEnv, force: bool) -> std::process::Output {
+    run_convert_session(env, "opencode", "opencode-real-sanitized", "pi", force)
+}
+
+/// Environment whose source is the real Pi fixture (`pi_real_sanitized.jsonl`,
+/// session id `id_0001`) instead of the OpenCode fixture.
+fn cli_pi_source_env(label: &str) -> CliTestEnv {
+    let root = std::env::temp_dir().join(format!(
+        "cash-cli-{label}-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let pi_root = root.join("pi-root");
+    std::fs::create_dir_all(&pi_root).unwrap();
+    std::fs::copy(
+        real_fixture("pi_real_sanitized.jsonl"),
+        pi_root.join("session.jsonl"),
+    )
+    .unwrap();
+    let db = root.join("opencode.db");
+    create_schema(&db);
+    CliTestEnv {
+        seed: root.join("pi").join("id_0001"),
+        pi_root,
+        root,
+        db,
+    }
+}
+
+fn run_convert_pi(env: &CliTestEnv, force: bool) -> std::process::Output {
+    run_convert_session(env, "pi", "id_0001", "opencode", force)
+}
+
+fn run_convert_session(
+    env: &CliTestEnv,
+    source: &str,
+    session: &str,
+    target: &str,
+    force: bool,
+) -> std::process::Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_cash"));
     command.args([
         "convert",
-        "opencode",
-        "opencode-real-sanitized",
-        "pi",
+        source,
+        session,
+        target,
         "--seed",
         env.seed.to_str().unwrap(),
         "--pi-root",
@@ -927,6 +1786,21 @@ fn run_convert(env: &CliTestEnv, force: bool) -> std::process::Output {
         command.arg("--force");
     }
     command.output().unwrap()
+}
+
+fn find_jsonl(root: &std::path::Path) -> PathBuf {
+    for entry in std::fs::read_dir(root).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            let found = find_jsonl(&path);
+            if found.exists() {
+                return found;
+            }
+        } else if path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
+            return path;
+        }
+    }
+    panic!("no jsonl under {}", root.display())
 }
 
 fn manifest_target(seed: &std::path::Path) -> serde_json::Value {
@@ -979,7 +1853,35 @@ fn create_schema(db: &std::path::Path) {
         CREATE TABLE part (
             id TEXT PRIMARY KEY, message_id TEXT NOT NULL, session_id TEXT NOT NULL,
             time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL
-        );",
+        );
+        -- v2 event-sourced tables (OpenCode >= 1.18): the importer writes the
+        -- durable event log and the session_message projection, and the event
+        -- foreign key enforces that event_sequence exists before any event.
+        CREATE TABLE event_sequence (
+            aggregate_id TEXT PRIMARY KEY, seq INTEGER NOT NULL, owner_id TEXT
+        );
+        CREATE TABLE event (
+            id TEXT PRIMARY KEY,
+            aggregate_id TEXT NOT NULL REFERENCES event_sequence(aggregate_id) ON DELETE CASCADE,
+            seq INTEGER NOT NULL, type TEXT NOT NULL, data TEXT NOT NULL
+        );
+        CREATE TABLE session_message (
+            id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+            type TEXT NOT NULL, seq INTEGER NOT NULL,
+            time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL
+        );
+        CREATE TABLE session_input (
+            id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+            prompt TEXT NOT NULL, delivery TEXT NOT NULL,
+            admitted_seq INTEGER NOT NULL, promoted_seq INTEGER, time_created INTEGER NOT NULL
+        );
+        CREATE TABLE session_context_epoch (
+            session_id TEXT PRIMARY KEY,
+            baseline TEXT NOT NULL, snapshot TEXT NOT NULL,
+            baseline_seq INTEGER NOT NULL, agent TEXT DEFAULT 'build' NOT NULL
+        );
+        CREATE INDEX session_message_session_seq_idx ON session_message (session_id, seq);
+        CREATE INDEX event_aggregate_seq_idx ON event (aggregate_id, seq);",
     )
     .unwrap();
     conn.execute("INSERT INTO project (id, worktree, name, time_created, time_updated, sandboxes) VALUES ('global', '/', '', 0, 0, '[]')", [])

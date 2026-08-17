@@ -36,12 +36,28 @@ pub struct TargetRef {
     pub dropped_event_count: usize,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SyncRef {
+    pub source_agent: String,
+    pub source_session_id: String,
+    pub source_file: String,
+    pub source_events_sha256: String,
+    pub target_agent: String,
+    pub target_session_id: String,
+    pub target_file: String,
+    pub target_anchor_message_id: String,
+    pub target_events_sha256: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
     pub version: u32,
     pub seed_files: Vec<String>,
     pub source: SourceRef,
     pub target: Option<TargetRef>,
+    #[serde(default)]
+    pub sync: Option<SyncRef>,
 }
 
 /// Write seed.json (canonical IR), seed.md (markdown transcript) and
@@ -49,13 +65,20 @@ pub struct Manifest {
 pub fn write_seed(trace: &Trace, out_dir: &Path) -> Result<Manifest, String> {
     std::fs::create_dir_all(out_dir).map_err(|e| format!("mkdir {}: {e}", out_dir.display()))?;
 
-    let existing_target = load_manifest(out_dir)
-        .ok()
-        .filter(|manifest| {
-            manifest.source.agent == trace.meta.source.as_str()
-                && manifest.source.session_id == trace.meta.session_id
-        })
-        .and_then(|manifest| manifest.target);
+    let existing_manifest = load_manifest(out_dir).ok().filter(|manifest| {
+        manifest.source.agent == trace.meta.source.as_str()
+            && manifest.source.session_id == trace.meta.session_id
+    });
+    let existing_target = existing_manifest
+        .as_ref()
+        .and_then(|manifest| manifest.target.clone());
+    let existing_sync = existing_manifest.and_then(|manifest| {
+        if manifest.source.events_sha256 == trace.meta.events_sha256 {
+            manifest.sync
+        } else {
+            None
+        }
+    });
 
     let seed_json = out_dir.join("seed.json");
     let seed_md = out_dir.join("seed.md");
@@ -81,6 +104,7 @@ pub fn write_seed(trace: &Trace, out_dir: &Path) -> Result<Manifest, String> {
             exported_at: Utc::now().to_rfc3339(),
         },
         target: existing_target,
+        sync: existing_sync,
     };
     let mjson = serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?;
     std::fs::write(&manifest_path, mjson)

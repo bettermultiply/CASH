@@ -62,24 +62,21 @@ pub fn import_existing(
     let mut writer = std::fs::File::create(&temporary)
         .map_err(|e| format!("create {}: {e}", temporary.display()))?;
 
-    // Events are the single representation; original_id is reused as the native
-    // item id, and turn linkage preserved via the `native` bag.
+    // Events are the single representation. Response-item IDs are encoded into
+    // Codex's restricted identifier alphabet, while turn linkage is preserved
+    // via the `native` bag.
     let (anchor, message_count) = {
         let header = session_meta(&session_id, &cwd, &now, sessions_root);
         write_jsonl(&mut writer, &header)?;
 
         let mut anchor = String::new();
         let mut message_count = 0usize;
-        // Sibling events derived from one native record share `original_id`;
-        // every written Codex record needs a unique id, so the first event of a
-        // group keeps the source id and later ones get a deterministic `~N`
-        // suffix (the reader strips it again).
-        let mut seen: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
-        let mut event_index = 0usize;
+        // Sibling events derived from one native record share `original_id`.
+        // Every response item needs a unique API-safe ID, including when the
+        // source itself used characters Codex does not accept.
+        let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
         for ev in &trace.events {
-            event_index += 1;
             let ts = rfc3339_ms(ev.time.unwrap_or_else(|| now.timestamp_millis()));
             // Restore the native turn linkage captured during extraction.
             let internal = ev
@@ -88,17 +85,12 @@ pub fn import_existing(
                 .and_then(|n| n.get("internal"))
                 .cloned()
                 .map(|v| json!({ "internal_chat_message_metadata_passthrough": v }));
-            let native_id = if ev.original_id.is_empty() {
-                format!("cash_evt_{event_index:05}")
-            } else {
+            let occurrence = {
                 let n = seen.entry(ev.original_id.clone()).or_insert(0);
                 *n += 1;
-                if *n == 1 {
-                    ev.original_id.clone()
-                } else {
-                    format!("{}~{}", ev.original_id, *n)
-                }
+                *n
             };
+            let native_id = imported_response_item_id(&ev.original_id, occurrence);
             match &ev.kind {
                 EventKind::UserMessage { text } => {
                     let mut payload = json!({
@@ -173,7 +165,7 @@ pub fn import_existing(
                         "id": native_id,
                         "name": name,
                         "arguments": arguments,
-                        "call_id": call_id,
+                        "call_id": imported_call_id(call_id),
                     });
                     merge_internal(&mut payload, &internal);
                     write_jsonl(&mut writer, &response_item(&ts, payload))?;
@@ -186,7 +178,7 @@ pub fn import_existing(
                     let mut payload = json!({
                         "type": "function_call_output",
                         "id": native_id,
-                        "call_id": call_id,
+                        "call_id": imported_call_id(call_id),
                         "output": [{"type": "input_text", "text": output}],
                     });
                     merge_internal(&mut payload, &internal);
@@ -197,7 +189,9 @@ pub fn import_existing(
                 // Preserve native records with no cross-agent semantic verbatim.
                 EventKind::NativeRecord { .. } => {
                     if let Some(native) = &ev.native {
-                        write_jsonl(&mut writer, native)?;
+                        let mut native = native.clone();
+                        normalize_native_response_item(&mut native, &native_id);
+                        write_jsonl(&mut writer, &native)?;
                         message_count += 1;
                         if let Some(id) = native
                             .get("payload")
@@ -231,6 +225,48 @@ pub fn import_existing(
         message_count,
         dropped_event_count: 0,
     })
+}
+
+const IMPORTED_ITEM_PREFIX: &str = "cash_item_";
+const IMPORTED_ITEM_SUFFIX: &str = "_n_";
+const IMPORTED_CALL_PREFIX: &str = "call_cash_";
+
+fn imported_response_item_id(original_id: &str, occurrence: usize) -> String {
+    format!(
+        "{IMPORTED_ITEM_PREFIX}{}{IMPORTED_ITEM_SUFFIX}{occurrence}",
+        hex_encode(original_id)
+    )
+}
+
+fn imported_call_id(original_id: &str) -> String {
+    format!("{IMPORTED_CALL_PREFIX}{}", hex_encode(original_id))
+}
+
+fn hex_encode(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(value.len() * 2);
+    for byte in value.bytes() {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn normalize_native_response_item(record: &mut Value, item_id: &str) {
+    if record.get("type").and_then(Value::as_str) != Some("response_item") {
+        return;
+    }
+    let Some(payload) = record.get_mut("payload").and_then(Value::as_object_mut) else {
+        return;
+    };
+    payload.insert("id".into(), Value::String(item_id.into()));
+    let call_id = payload
+        .get("call_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    if let Some(call_id) = call_id {
+        payload.insert("call_id".into(), Value::String(imported_call_id(&call_id)));
+    }
 }
 
 fn session_meta(

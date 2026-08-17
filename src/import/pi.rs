@@ -90,7 +90,7 @@ pub fn import_existing(
                 j += 1;
             }
             let group = &trace.events[i..j];
-            for mut entry in render_group(group, now, model_override, parent_id.as_deref()) {
+            for mut entry in render_group(group, now, model_override, parent_id.as_deref(), &used_ids) {
                 // Distinct native records must not share an entry id; when the
                 // source reuses one original_id (e.g. OpenCode tool call+result)
                 // disambiguate the derived Pi ids.
@@ -153,12 +153,17 @@ fn render_group(
     now: i64,
     model_override: Option<&str>,
     parent: Option<&str>,
+    used_ids: &HashSet<String>,
 ) -> Vec<Value> {
     let id = group[0].original_id.clone();
-    let parent_id = group[0]
-        .parent_original_id
-        .clone()
-        .or_else(|| parent.map(str::to_owned));
+    // Keep the source parent only when it refers to a record already written to
+    // this file (same-agent round trip). Foreign ids (e.g. OpenCode message ids
+    // during a cross-agent sync) fall back to the file's own chain so Pi's
+    // parentId-based view never breaks.
+    let parent_id = match group[0].parent_original_id.as_deref() {
+        Some(pid) if used_ids.contains(pid) => Some(pid.to_string()),
+        _ => parent.map(str::to_owned),
+    };
     let ts = group.iter().find_map(|e| e.time).unwrap_or(now);
     // Pi-shaped native metadata: the message object minus its content array.
     let native = group
@@ -197,9 +202,11 @@ fn render_group(
             .collect();
         if !rest.is_empty() {
             let blocks = assistant_blocks(&rest);
-            let mut message = native
-                .cloned()
-                .unwrap_or_else(|| json!({ "role": "assistant" }));
+            let mut message = match native {
+                Some(n) if is_pi_native(n) => n.clone(),
+                Some(n) => assistant_message_from_native(n, ts),
+                None => json!({ "role": "assistant" }),
+            };
             message["content"] = json!(blocks);
             if message.get("timestamp").is_none() {
                 message["timestamp"] = json!(ts);
@@ -216,9 +223,10 @@ fn render_group(
                 continue;
             };
             let event_ts = event.time.unwrap_or(ts);
-            let mut message = native
-                .cloned()
-                .unwrap_or_else(|| json!({ "role": "toolResult" }));
+            let mut message = match native {
+                Some(n) if is_pi_native(n) => n.clone(),
+                _ => json!({ "role": "toolResult" }),
+            };
             message["role"] = json!("toolResult");
             message["content"] = json!([{ "type": "text", "text": output }]);
             if message.get("toolCallId").is_none() {
@@ -256,7 +264,10 @@ fn render_group(
     if group.len() == 1
         && let EventKind::UserMessage { text } = &group[0].kind
     {
-        let mut message = native.cloned().unwrap_or_else(|| json!({ "role": "user" }));
+        let mut message = match native {
+            Some(n) if is_pi_native(n) => n.clone(),
+            _ => json!({ "role": "user" }),
+        };
         message["content"] = json!([{ "type": "text", "text": text }]);
         if message.get("timestamp").is_none() {
             message["timestamp"] = json!(ts);
@@ -300,13 +311,15 @@ fn render_group(
         }
     }
 
-    let mut message = if let Some(native) = native {
-        native.clone()
-    } else {
-        let model = model_override
-            .map(str::to_owned)
-            .unwrap_or_else(|| "cash".into());
-        assistant_message("cash", &model, "stop", ts, json!([]))
+    let mut message = match native {
+        Some(n) if is_pi_native(n) => n.clone(),
+        Some(n) => assistant_message_from_native(n, ts),
+        None => {
+            let model = model_override
+                .map(str::to_owned)
+                .unwrap_or_else(|| "cash".into());
+            assistant_message("cash", &model, "stop", ts, json!([]))
+        }
     };
     if let Some(model) = model_override {
         message["model"] = json!(model);
@@ -317,6 +330,70 @@ fn render_group(
     }
     ensure_assistant_required_fields(&mut message);
     vec![pi_message(&id, parent_id.as_deref(), ts, message)]
+}
+
+/// Pi-shaped message metadata carries a numeric `timestamp` (and `api` for
+/// assistant messages). OpenCode/Codex messages use different field sets and
+/// are normalized away so the Pi file only ever contains native Pi shapes.
+fn is_pi_native(native: &Value) -> bool {
+    native.get("timestamp").is_some() || native.get("api").and_then(Value::as_str).is_some()
+}
+
+/// Build a Pi-native assistant message from cross-agent metadata (e.g. an
+/// OpenCode message with providerID/modelID/tokens), mapping the fields Pi
+/// actually reads.
+fn assistant_message_from_native(native: &Value, ts: i64) -> Value {
+    let provider = native
+        .get("providerID")
+        .and_then(Value::as_str)
+        .unwrap_or("cash")
+        .to_string();
+    let model = native
+        .get("modelID")
+        .and_then(Value::as_str)
+        .unwrap_or("cash")
+        .to_string();
+    let mut message = assistant_message(&provider, &model, "stop", ts, json!([]));
+    if let Some(tokens) = native.get("tokens").and_then(Value::as_object) {
+        let num = |k: &str| {
+            tokens
+                .get(k)
+                .and_then(Value::as_f64)
+                .map(|f| f as i64)
+                .unwrap_or(0)
+        };
+        let cache = tokens.get("cache").and_then(Value::as_object);
+        let cache_read = cache
+            .and_then(|c| c.get("read"))
+            .and_then(Value::as_f64)
+            .map(|f| f as i64)
+            .unwrap_or(0);
+        let cache_write = cache
+            .and_then(|c| c.get("write"))
+            .and_then(Value::as_f64)
+            .map(|f| f as i64)
+            .unwrap_or(0);
+        let input = num("input");
+        let output = num("output");
+        let reasoning = num("reasoning");
+        let total = input + output + reasoning + cache_read + cache_write;
+        let cost = native.get("cost").and_then(Value::as_f64).unwrap_or(0.0);
+        message["usage"] = json!({
+            "input": input,
+            "output": output,
+            "cacheRead": cache_read,
+            "cacheWrite": cache_write,
+            "totalTokens": total,
+            "cost": {
+                "input": 0,
+                "output": 0,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "total": cost
+            }
+        });
+    }
+    message
 }
 
 /// Build Pi content blocks from assistant events (text / thinking / toolCall).

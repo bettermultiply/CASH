@@ -20,7 +20,13 @@ fn opencode_cli_can_list_and_export_imported_session() {
     let db = opencode_dir.join("opencode.db");
     copy_opencode_db(&source_db, &db);
 
-    let trace = readers::pi::read(&fixture("real/pi_real_sanitized.jsonl")).unwrap();
+    let mut trace = readers::pi::read(&fixture("real/pi_real_sanitized.jsonl")).unwrap();
+    trace.meta.cwd = Some(
+        std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned(),
+    );
     let result = import::opencode::import(&trace, &db).expect("import into temp opencode db");
 
     let list = opencode(&xdg, ["session", "list"]);

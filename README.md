@@ -99,6 +99,32 @@ cargo run -- convert opencode <SESSION_ID> pi --force
 
 `--force` 保留目标 session 身份，只替换导入内容。OpenCode 目标同样受保护。
 
+### 目标 Agent 继续运行后同步回源 Session
+
+第一次转换会在 seed 的 `manifest.json` 中记录源 session 与目标 session 的绑定。目标 Agent 中继续运行后，直接使用**原始 source session ID** 执行：
+
+```bash
+cargo run -- sync <SOURCE_SESSION_ID>
+```
+
+例如 Pi 转 Codex 后，把 Codex 新增内容同步回原 Pi session：
+
+```bash
+cargo run -- sync 01a00e3b-4852-7083-aa79-7631de474429
+```
+
+CASH 会在 `opencode`、`pi`、`codex` seed 目录中定位对应 source session，不需要传完整路径。自定义 seed 目录或旧版映射仍可显式使用 `--seed`。
+
+`sync` 只读取目标锚点之后的新事件并追加回**原始 source session**，不会创建第二个 source session。成功后会更新同步锚点，因此重复运行不会重复插入记录。Codex 自动注入的 developer、权限和环境上下文不会作为用户消息回写。
+
+同步前会校验 source session 自上次转换或同步后未被独立修改；检测到双方都有新增内容时默认停止。确认需要追加时可传 `--force`：
+
+```bash
+cargo run -- sync <SOURCE_SESSION_ID> --force
+```
+
+当前支持 OpenCode、Pi 和 Codex 之间的线性“转换到目标、在目标继续、同步回源”流程；两边同时继续后的自动三方合并仍未实现。
+
 ## 种子目录配置
 
 输出目录可选。解析顺序：
@@ -210,12 +236,12 @@ cargo run --bin make_fixtures -- --out tests/fixtures/real
 ## 未来方向
 
 - **执行环境打包**：当前只迁移 session 历史，工作区/依赖/运行状态依赖磁盘。未来支持把执行环境整体打包（如 `tar.zst`），让一个"作业"可以 import 到其他执行环境运行，而不是只在当前机器上接力。
-- **双向增量合并**：两个副本同时新增内容时的分支/合并语义仍在设计中。
+- **双向增量合并**：OpenCode、Pi、Codex 之间的线性回写已支持；两个副本同时新增内容时的分支/合并语义仍在设计中。
 - **模型能力检测**：根据各 agent 支持的模型做自动映射与提示。
 
 ## 当前限制
 
 - 跨 agent 时，不同目标可表示的事件子集不同，请查看 `manifest.json` 的 `dropped_event_count`。
 - 锚点之后继续过的目标 session 需要显式 `--force` 才能被替换。
-- 双向增量合并（两副本同时新增）仍在设计中，当前同步模型是单方向增量追加。
+- `sync` 支持目标 Agent 增量回写源 session；两副本同时新增后的自动合并仍在设计中。
 - 自动模型能力检测 / 模型映射表仍在设计中。
